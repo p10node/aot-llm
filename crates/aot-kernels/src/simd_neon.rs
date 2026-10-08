@@ -77,9 +77,10 @@ macro_rules! neon_kernels {
                 let mut acc1 = vdupq_n_f32(0.0);
                 let wp = w.as_ptr();
                 let mut i = 0;
+                let xp = x.as_ptr();
                 while i + 2 <= nb {
-                    let (p0, d0) = q4_0_block(wp.add(i * Q4_0_SIZE), &x[i], m4, s8);
-                    let (p1, d1) = q4_0_block(wp.add((i + 1) * Q4_0_SIZE), &x[i + 1], m4, s8);
+                    let (p0, d0) = q4_0_block(wp.add(i * Q4_0_SIZE), &*xp.add(i), m4, s8);
+                    let (p1, d1) = q4_0_block(wp.add((i + 1) * Q4_0_SIZE), &*xp.add(i + 1), m4, s8);
                     acc0 = vmlaq_n_f32(acc0, vcvtq_f32_s32(p0), d0);
                     acc1 = vmlaq_n_f32(acc1, vcvtq_f32_s32(p1), d1);
                     i += 2;
@@ -110,9 +111,10 @@ macro_rules! neon_kernels {
                 let mut acc1 = vdupq_n_f32(0.0);
                 let wp = w.as_ptr();
                 let mut i = 0;
+                let xp = x.as_ptr();
                 while i + 2 <= nb {
-                    let (p0, d0) = q8_0_block(wp.add(i * Q8_0_SIZE), &x[i]);
-                    let (p1, d1) = q8_0_block(wp.add((i + 1) * Q8_0_SIZE), &x[i + 1]);
+                    let (p0, d0) = q8_0_block(wp.add(i * Q8_0_SIZE), &*xp.add(i));
+                    let (p1, d1) = q8_0_block(wp.add((i + 1) * Q8_0_SIZE), &*xp.add(i + 1));
                     acc0 = vmlaq_n_f32(acc0, vcvtq_f32_s32(p0), d0);
                     acc1 = vmlaq_n_f32(acc1, vcvtq_f32_s32(p1), d1);
                     i += 2;

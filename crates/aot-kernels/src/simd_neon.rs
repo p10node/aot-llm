@@ -259,6 +259,169 @@ macro_rules! neon_kernels {
                 }
                 sumf
             }
+
+            // ---- 1x4 micro-kernels: one weight row against four activation
+            // vectors. Each weight block is decoded once and reused, and the
+            // per-activation arithmetic is identical to the single kernels so
+            // results are bit-for-bit the same.
+
+            #[target_feature(enable = $feat)]
+            pub unsafe fn dot_q4_0_q8_0_x4(w: &[u8], xs: [&[BlockQ8_0]; 4]) -> [f32; 4] {
+                let nb = xs[0].len();
+                debug_assert!(w.len() >= nb * Q4_0_SIZE);
+                let m4 = vdupq_n_u8(0x0F);
+                let s8 = vdupq_n_s8(8);
+                let zero = vdupq_n_s32(0);
+                let mut acc0 = [vdupq_n_f32(0.0); 4];
+                let mut acc1 = [vdupq_n_f32(0.0); 4];
+                let wp = w.as_ptr();
+                for i in 0..nb {
+                    let b = wp.add(i * Q4_0_SIZE);
+                    let d = f16_at(b);
+                    let q = vld1q_u8(b.add(2));
+                    let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q, m4)), s8);
+                    let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(q)), s8);
+                    for k in 0..4 {
+                        let y = xs[k].get_unchecked(i);
+                        let yp = y.qs.as_ptr();
+                        let p = vdot(vdot(zero, lo, vld1q_s8(yp)), hi, vld1q_s8(yp.add(16)));
+                        if i % 2 == 0 {
+                            acc0[k] = vmlaq_n_f32(acc0[k], vcvtq_f32_s32(p), d * y.d);
+                        } else {
+                            acc1[k] = vmlaq_n_f32(acc1[k], vcvtq_f32_s32(p), d * y.d);
+                        }
+                    }
+                }
+                [
+                    vaddvq_f32(vaddq_f32(acc0[0], acc1[0])),
+                    vaddvq_f32(vaddq_f32(acc0[1], acc1[1])),
+                    vaddvq_f32(vaddq_f32(acc0[2], acc1[2])),
+                    vaddvq_f32(vaddq_f32(acc0[3], acc1[3])),
+                ]
+            }
+
+            #[target_feature(enable = $feat)]
+            pub unsafe fn dot_q8_0_q8_0_x4(w: &[u8], xs: [&[BlockQ8_0]; 4]) -> [f32; 4] {
+                let nb = xs[0].len();
+                debug_assert!(w.len() >= nb * Q8_0_SIZE);
+                let zero = vdupq_n_s32(0);
+                let mut acc0 = [vdupq_n_f32(0.0); 4];
+                let mut acc1 = [vdupq_n_f32(0.0); 4];
+                let wp = w.as_ptr();
+                for i in 0..nb {
+                    let b = wp.add(i * Q8_0_SIZE);
+                    let d = f16_at(b);
+                    let q0 = vld1q_s8(b.add(2) as *const i8);
+                    let q1 = vld1q_s8(b.add(18) as *const i8);
+                    for k in 0..4 {
+                        let y = xs[k].get_unchecked(i);
+                        let yp = y.qs.as_ptr();
+                        let p = vdot(vdot(zero, q0, vld1q_s8(yp)), q1, vld1q_s8(yp.add(16)));
+                        if i % 2 == 0 {
+                            acc0[k] = vmlaq_n_f32(acc0[k], vcvtq_f32_s32(p), d * y.d);
+                        } else {
+                            acc1[k] = vmlaq_n_f32(acc1[k], vcvtq_f32_s32(p), d * y.d);
+                        }
+                    }
+                }
+                [
+                    vaddvq_f32(vaddq_f32(acc0[0], acc1[0])),
+                    vaddvq_f32(vaddq_f32(acc0[1], acc1[1])),
+                    vaddvq_f32(vaddq_f32(acc0[2], acc1[2])),
+                    vaddvq_f32(vaddq_f32(acc0[3], acc1[3])),
+                ]
+            }
+
+            #[target_feature(enable = $feat)]
+            pub unsafe fn dot_q4_k_q8_k_x4(w: &[u8], xs: [&[BlockQ8_K]; 4]) -> [f32; 4] {
+                let nb = xs[0].len();
+                debug_assert!(w.len() >= nb * Q4_K_SIZE);
+                let m4 = vdupq_n_u8(0x0F);
+                let zero = vdupq_n_s32(0);
+                let mut sumf = [0f32; 4];
+                for i in 0..nb {
+                    let b = w.as_ptr().add(i * Q4_K_SIZE);
+                    let d = f16_at(b);
+                    let dmin = f16_at(b.add(2));
+                    let s = std::slice::from_raw_parts(b.add(4), 12);
+                    let mut sc = [0i32; 8];
+                    let mut mn = [0i32; 8];
+                    for j in 0..8 {
+                        let (a, m) = scale_min_k4(j, s);
+                        sc[j] = a as i32;
+                        mn[j] = m as i32;
+                    }
+                    let qs = b.add(16);
+                    let mut sumi = [zero; 4];
+                    for j in 0..4 {
+                        let q0 = vld1q_u8(qs.add(32 * j));
+                        let q1 = vld1q_u8(qs.add(32 * j + 16));
+                        let l0 = vreinterpretq_s8_u8(vandq_u8(q0, m4));
+                        let l1 = vreinterpretq_s8_u8(vandq_u8(q1, m4));
+                        let h0 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(q0));
+                        let h1 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(q1));
+                        for k in 0..4 {
+                            let yj = xs[k].get_unchecked(i).qs.as_ptr().add(64 * j);
+                            let p_lo = vdot(vdot(zero, l0, vld1q_s8(yj)), l1, vld1q_s8(yj.add(16)));
+                            let p_hi = vdot(vdot(zero, h0, vld1q_s8(yj.add(32))), h1, vld1q_s8(yj.add(48)));
+                            sumi[k] = vmlaq_n_s32(sumi[k], p_lo, sc[2 * j]);
+                            sumi[k] = vmlaq_n_s32(sumi[k], p_hi, sc[2 * j + 1]);
+                        }
+                    }
+                    for k in 0..4 {
+                        let y = xs[k].get_unchecked(i);
+                        let mut summ = 0i32;
+                        for j in 0..8 {
+                            summ += mn[j] * (y.bsums[2 * j] as i32 + y.bsums[2 * j + 1] as i32);
+                        }
+                        sumf[k] += (d * y.d) * vaddvq_s32(sumi[k]) as f32 - (dmin * y.d) * summ as f32;
+                    }
+                }
+                sumf
+            }
+
+            #[target_feature(enable = $feat)]
+            pub unsafe fn dot_q6_k_q8_k_x4(w: &[u8], xs: [&[BlockQ8_K]; 4]) -> [f32; 4] {
+                let nb = xs[0].len();
+                debug_assert!(w.len() >= nb * Q6_K_SIZE);
+                let m4 = vdupq_n_u8(0x0F);
+                let m3 = vdupq_n_u8(0x03);
+                let s32 = vdupq_n_s8(32);
+                let zero = vdupq_n_s32(0);
+                let mut sumf = [0f32; 4];
+                for i in 0..nb {
+                    let b = w.as_ptr().add(i * Q6_K_SIZE);
+                    let d = f16_at(b.add(208));
+                    let mut sumi = [zero; 4];
+                    for n in 0..2 {
+                        let ql = b.add(64 * n);
+                        let qh = b.add(128 + 32 * n);
+                        let sc = b.add(192 + 8 * n) as *const i8;
+                        for half in 0..2 {
+                            let l = 16 * half;
+                            let ql0 = vld1q_u8(ql.add(l));
+                            let ql32 = vld1q_u8(ql.add(32 + l));
+                            let qhv = vld1q_u8(qh.add(l));
+                            let q1 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql0, m4), vshlq_n_u8::<4>(vandq_u8(qhv, m3)))), s32);
+                            let q2 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql32, m4), vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(qhv), m3)))), s32);
+                            let q3 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql0), vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(qhv), m3)))), s32);
+                            let q4 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql32), vshlq_n_u8::<4>(vshrq_n_u8::<6>(qhv)))), s32);
+                            let (s0, s1, s2, s3) = (*sc.add(half) as i32, *sc.add(half + 2) as i32, *sc.add(half + 4) as i32, *sc.add(half + 6) as i32);
+                            for k in 0..4 {
+                                let yp = xs[k].get_unchecked(i).qs.as_ptr().add(128 * n);
+                                sumi[k] = vmlaq_n_s32(sumi[k], vdot(zero, q1, vld1q_s8(yp.add(l))), s0);
+                                sumi[k] = vmlaq_n_s32(sumi[k], vdot(zero, q2, vld1q_s8(yp.add(32 + l))), s1);
+                                sumi[k] = vmlaq_n_s32(sumi[k], vdot(zero, q3, vld1q_s8(yp.add(64 + l))), s2);
+                                sumi[k] = vmlaq_n_s32(sumi[k], vdot(zero, q4, vld1q_s8(yp.add(96 + l))), s3);
+                            }
+                        }
+                    }
+                    for k in 0..4 {
+                        sumf[k] += (d * xs[k].get_unchecked(i).d) * vaddvq_s32(sumi[k]) as f32;
+                    }
+                }
+                sumf
+            }
         }
     };
 }
@@ -347,6 +510,27 @@ macro_rules! safe_wrappers {
     };
 }
 
+macro_rules! safe_wrappers_x4 {
+    ($($name:ident = $path:path : $xt:ty;)*) => {
+        $( fn $name(w: &[u8], xs: [&[$xt]; 4]) -> [f32; 4] {
+            // SAFETY: only reachable through a kernel table whose selection
+            // checked the required CPU features at runtime.
+            unsafe { $path(w, xs) }
+        } )*
+    };
+}
+
+safe_wrappers_x4! {
+    dp_q4_0_x4 = dotprod::dot_q4_0_q8_0_x4 : BlockQ8_0;
+    dp_q8_0_x4 = dotprod::dot_q8_0_q8_0_x4 : BlockQ8_0;
+    dp_q4_k_x4 = dotprod::dot_q4_k_q8_k_x4 : BlockQ8_K;
+    dp_q6_k_x4 = dotprod::dot_q6_k_q8_k_x4 : BlockQ8_K;
+    pl_q4_0_x4 = plain::dot_q4_0_q8_0_x4 : BlockQ8_0;
+    pl_q8_0_x4 = plain::dot_q8_0_q8_0_x4 : BlockQ8_0;
+    pl_q4_k_x4 = plain::dot_q4_k_q8_k_x4 : BlockQ8_K;
+    pl_q6_k_x4 = plain::dot_q6_k_q8_k_x4 : BlockQ8_K;
+}
+
 safe_wrappers! {
     dp_q4_0 = dotprod::dot_q4_0_q8_0 : BlockQ8_0;
     dp_q8_0 = dotprod::dot_q8_0_q8_0 : BlockQ8_0;
@@ -373,6 +557,10 @@ pub const DOTPROD_KERNELS: super::Kernels = super::Kernels {
     f16_f32: f16,
     bf16_f32: bf16,
     f32_f32: f32w,
+    q4_0_q8_0_x4: Some(dp_q4_0_x4),
+    q8_0_q8_0_x4: Some(dp_q8_0_x4),
+    q4_k_q8_k_x4: Some(dp_q4_k_x4),
+    q6_k_q8_k_x4: Some(dp_q6_k_x4),
 };
 
 pub const PLAIN_KERNELS: super::Kernels = super::Kernels {
@@ -385,4 +573,8 @@ pub const PLAIN_KERNELS: super::Kernels = super::Kernels {
     f16_f32: f16,
     bf16_f32: bf16,
     f32_f32: f32w,
+    q4_0_q8_0_x4: Some(pl_q4_0_x4),
+    q8_0_q8_0_x4: Some(pl_q8_0_x4),
+    q4_k_q8_k_x4: Some(pl_q4_k_x4),
+    q6_k_q8_k_x4: Some(pl_q6_k_x4),
 };

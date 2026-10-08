@@ -310,9 +310,10 @@ fn compile_run_and_match_reference() {
     let parsed = GgufFile::parse(&gguf, gguf.len() as u64).unwrap();
     let (blob, _) = build_blob(&parsed).unwrap();
     let tok = Tokenizer::new(Box::leak(blob.into_boxed_slice())).unwrap();
-    let prompt = "the capital of hello world is";
-    let ids = tok.encode(prompt, true, true);
-    assert_eq!(ids.len(), 7, "{ids:?}");
+    let repeat: usize = std::env::var("E2E_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let prompt = vec!["the capital of hello world is"; repeat].join(" ");
+    let ids = tok.encode(&prompt, true, true);
+    assert_eq!(ids.len(), 1 + 6 * repeat, "{ids:?}");
     let expected = reference_logits(&model, &ids);
 
     let status = Command::new(env!("CARGO_BIN_EXE_aot-llm"))
@@ -325,22 +326,24 @@ fn compile_run_and_match_reference() {
         .expect("running aot-llm");
     assert!(status.success(), "aot-llm compile failed");
 
-    let run = Command::new(&out).args(["--prompt", prompt, "--dump-logits", "--quiet"]).output().expect("running compiled binary");
-    assert!(run.status.success(), "binary failed: {}", String::from_utf8_lossy(&run.stderr));
-    let got: Vec<f32> = String::from_utf8_lossy(&run.stdout).split_whitespace().map(|v| v.parse().unwrap()).collect();
-    assert_eq!(got.len(), expected.len());
-
-    let max_abs = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
-    let max_err = got.iter().zip(&expected).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
-    eprintln!("max |logit| {max_abs:.3}, max abs error {max_err:.4}, argmax {} vs {}", argmax(&got), argmax(&expected));
-    // The reference applies the same activation quantization, so only float
-    // summation-order noise remains.
-    assert!(max_err <= 2e-3 * max_abs + 1e-3, "logits differ: max error {max_err} (range {max_abs})");
-    assert_eq!(argmax(&got), argmax(&expected));
+    // Both prompt paths (token by token and batched) must match the reference.
+    for batch in ["1", "128"] {
+        let run = Command::new(&out).args(["--prompt", &prompt, "--dump-logits", "--quiet", "--batch", batch]).output().expect("running compiled binary");
+        assert!(run.status.success(), "binary failed: {}", String::from_utf8_lossy(&run.stderr));
+        let got: Vec<f32> = String::from_utf8_lossy(&run.stdout).split_whitespace().map(|v| v.parse().unwrap()).collect();
+        assert_eq!(got.len(), expected.len());
+        let max_abs = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let max_err = got.iter().zip(&expected).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        eprintln!("batch {batch}: {} prompt tokens, max |logit| {max_abs:.3}, max abs error {max_err:.4}, argmax {} vs {}", ids.len(), argmax(&got), argmax(&expected));
+        // The reference applies the same activation quantization, so only float
+        // summation-order noise remains.
+        assert!(max_err <= 2e-3 * max_abs + 1e-3, "batch {batch}: logits differ: max error {max_err} (range {max_abs})");
+        assert_eq!(argmax(&got), argmax(&expected));
+    }
 
     // Generation runs and stops cleanly.
-    let gen = Command::new(&out).args(["--prompt", prompt, "-n", "8", "--tokens", "--quiet", "--threads", "2"]).output().unwrap();
+    let gen = Command::new(&out).args(["--prompt", &prompt, "-n", "8", "--tokens", "--quiet", "--threads", "2"]).output().unwrap();
     assert!(gen.status.success());
     let n = String::from_utf8_lossy(&gen.stdout).split_whitespace().count();
     assert!((1..=8).contains(&n), "generated {n} tokens");

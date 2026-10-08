@@ -19,12 +19,19 @@ use std::time::Instant;
 
 /// Static forward pass: `(state, weights, pool, token, position, want_logits)`.
 pub type ForwardFn = fn(&mut State, &Weights, &Pool, u32, usize, bool);
+/// Batched forward pass over consecutive prompt tokens:
+/// `(state, weights, pool, tokens, first_position, want_logits)`.
+pub type ForwardBatchFn = fn(&mut State, &Weights, &Pool, &[u32], usize, bool);
+
+/// Default number of prompt tokens per batched step.
+pub const DEFAULT_BATCH: usize = 64;
 
 /// Everything the driver needs from the generated model module.
 pub struct Runtime {
     pub dims: &'static Dims,
     pub info: &'static ModelInfo,
     pub forward: ForwardFn,
+    pub forward_batch: ForwardBatchFn,
     /// Optional per-dimension RoPE frequency factors (Llama 3.x scaling).
     pub rope_freqs: Option<Tensor>,
     pub tokenizer_blob: &'static [u8],
@@ -41,6 +48,7 @@ struct Args {
     sampler: SamplerConfig,
     ctx: Option<usize>,
     threads: Option<usize>,
+    batch: usize,
     chat: bool,
     system: Option<String>,
     no_bos: bool,
@@ -67,6 +75,7 @@ Options:
       --seed N             RNG seed [default: 42]
   -c, --ctx N              Context length [default: prompt + max-tokens]
   -t, --threads N          Worker threads [default: min(cores, 8)]
+  -b, --batch N            Prompt tokens per batched step, 1 = token by token [default: 64]
       --chat               Wrap the prompt in the model's chat template
       --system TEXT        System prompt for --chat
       --no-bos             Do not prepend the BOS token
@@ -88,6 +97,7 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
         sampler: SamplerConfig::default(),
         ctx: None,
         threads: None,
+        batch: DEFAULT_BATCH,
         chat: false,
         system: None,
         no_bos: false,
@@ -118,6 +128,7 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
             "--seed" => a.sampler.seed = next(&mut i, f)?.parse().map_err(|_| "bad --seed")?,
             "-c" | "--ctx" => a.ctx = Some(next(&mut i, f)?.parse().map_err(|_| "bad --ctx")?),
             "-t" | "--threads" => a.threads = Some(next(&mut i, f)?.parse().map_err(|_| "bad --threads")?),
+            "-b" | "--batch" => a.batch = next(&mut i, f)?.parse::<usize>().map_err(|_| "bad --batch")?.max(1),
             "--chat" => a.chat = true,
             "--system" => a.system = Some(next(&mut i, f)?),
             "--no-bos" => a.no_bos = true,
@@ -292,19 +303,56 @@ pub fn main(rt: Runtime) -> i32 {
         return 2;
     }
     let rope_ff = rt.rope_freqs.as_ref().map(|t| weights.f32s(t));
-    let mut state = State::new(d, ctx, rope_ff);
+    let batch = args.batch.min(prompt.len()).max(1);
+    let mut state = State::new(d, ctx, rope_ff, threads, batch);
     let t_ready = t0.elapsed();
 
     if args.prefetch {
         weights::prefetch(&wbytes[..rt.info.weights_len]);
     }
 
-    // Prompt evaluation (logits are only needed for the last prompt token).
+    // Prompt evaluation in batches (logits are only needed for the last token).
     let t1 = Instant::now();
-    for (i, &t) in prompt.iter().enumerate() {
-        (rt.forward)(&mut state, &weights, &pool, t, i, i + 1 == prompt.len());
+    let mut done = 0usize;
+    while done < prompt.len() {
+        let end = (done + batch).min(prompt.len());
+        let last = end == prompt.len();
+        if end - done == 1 {
+            (rt.forward)(&mut state, &weights, &pool, prompt[done], done, last);
+        } else {
+            (rt.forward_batch)(&mut state, &weights, &pool, &prompt[done..end], done, last);
+        }
+        done = end;
     }
     let t_prompt = t1.elapsed();
+
+    if std::env::var_os("AOT_DEBUG_COMPARE").is_some() && batch > 1 {
+        // Debug aid: re-run the prompt token by token in a fresh state and
+        // report the first (layer, position) where the KV caches diverge.
+        let mut s2 = State::new(d, ctx, rope_ff, threads, 1);
+        for (i, &t) in prompt.iter().enumerate() {
+            (rt.forward)(&mut s2, &weights, &pool, t, i, i + 1 == prompt.len());
+        }
+        let kv = d.kv_dim();
+        let mut first: Option<(usize, usize, f32, &str)> = None;
+        for layer in 0..d.n_layer {
+            for pos in 0..prompt.len() {
+                let at = (layer * ctx + pos) * kv;
+                let dk = state.k_cache[at..at + kv].iter().zip(&s2.k_cache[at..at + kv]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                let dv = state.v_cache[at..at + kv].iter().zip(&s2.v_cache[at..at + kv]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                if (dk > 0.0 || dv > 0.0) && first.is_none() {
+                    let nk = state.k_cache[at..at + kv].iter().zip(&s2.k_cache[at..at + kv]).filter(|(a, b)| a != b).count();
+                    eprintln!("[debug] {nk} of {kv} k values differ at layer {layer} pos {pos}");
+                    first = Some((layer, pos, dk.max(dv), if dk > 0.0 { "k" } else { "v" }));
+                }
+            }
+        }
+        let dl = state.logits.iter().zip(&s2.logits).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        match first {
+            Some((l, p, dd, which)) => eprintln!("[debug] first KV divergence at layer {l} pos {p} ({which}, max diff {dd}); logits max diff {dl}"),
+            None => eprintln!("[debug] KV caches identical; logits max diff {dl}"),
+        }
+    }
 
     if args.dump_logits {
         let mut line = String::with_capacity(state.logits.len() * 10);

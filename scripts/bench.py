@@ -130,7 +130,9 @@ def bench_binary(name: str, path: str, runs: int, threads: int, ctx_extra: list[
         "chat": {
             "prompt_tokens": chat[0].get("prompt_tokens"),
             "first_token_ms": med(chat, "first_token_ms"),
+            "first_token_ms_min": min(r["first_token_ms"] for r in chat),
             "prompt_tps": med(chat, "prompt_tps"),
+            "prompt_tps_max": max(r["prompt_tps"] for r in chat),
         },
         "sample_output": warm[0]["text"],
     }
@@ -247,13 +249,16 @@ def cmd_summary(a) -> None:
          "One file per measurement, newest last. Every entry is produced by `scripts/bench.py run` on the same machine "
          "with the same prompts; see each file for the exact method. `ollama-reference.md` holds the llama.cpp/Ollama "
          "numbers the baseline was compared against.\n",
-         "| # | label | commit | binary | startup (ms) | cold first token (ms) | warm first token (ms) | chat first token (ms) | prompt tok/s | decode tok/s | peak RSS (MiB) |",
-         "|---|---|---|---|---|---|---|---|---|---|---|"]
+         "Throughput columns show the median of the warm runs and, in parentheses, the best run; the best run is the "
+         "better estimate when other processes were competing for the CPU (see the load average in each file).\n",
+         "| # | label | commit | binary | startup (ms) | cold first token (ms) | warm first token (ms) | chat first token (ms) | chat prompt tok/s | decode tok/s | peak RSS (MiB) | load |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for i, r in enumerate(runs, 1):
+        load = r["machine"].get("load_avg", ["?"])[0]
         for b in r["binaries"]:
             L.append(f"| {i} | [{r['label']}]({i:02d}-{r['label']}.md) | `{r['git']['commit']}` | {b['name']} | {fmt(b['warm']['startup_ms'], 3)} | "
-                     f"{fmt(b['cold']['first_token_ms'], 0)} | {fmt(b['warm']['first_token_ms'], 0)} | {fmt(b['chat']['first_token_ms'], 0)} | "
-                     f"{fmt(b['warm']['prompt_tps'])} | {fmt(b['warm']['gen_tps'])} | {fmt(b['warm']['peak_rss_mib'], 0)} |")
+                     f"{fmt(b['cold']['first_token_ms'], 0)} | {fmt(b['warm']['first_token_ms'], 0)} | {fmt(b['chat']['first_token_ms'], 0)} ({fmt(b['chat'].get('first_token_ms_min'), 0)}) | "
+                     f"{fmt(b['chat']['prompt_tps'])} ({fmt(b['chat'].get('prompt_tps_max'))}) | {fmt(b['warm']['gen_tps'])} ({fmt(b['warm']['gen_tps_max'])}) | {fmt(b['warm']['peak_rss_mib'], 0)} | {load} |")
     (d / "README.md").write_text("\n".join(L) + "\n")
 
 

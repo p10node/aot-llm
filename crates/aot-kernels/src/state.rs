@@ -146,12 +146,29 @@ pub struct State {
     pub inv_freq: Vec<f32>,
     /// Interleaved (cos, sin) for the current position, `rot_dim`.
     pub rope_cs: Vec<f32>,
+    /// Largest number of prompt tokens processed in one batched step.
+    pub max_batch: usize,
+    /// Batched activations (`max_batch` rows each); empty when `max_batch == 1`.
+    pub bx: Vec<f32>,
+    pub bxb: Vec<f32>,
+    pub bxb2: Vec<f32>,
+    pub bq: Vec<f32>,
+    pub bk: Vec<f32>,
+    pub bv: Vec<f32>,
+    pub bhb: Vec<f32>,
+    pub bhb2: Vec<f32>,
+    pub brope_cs: Vec<f32>,
+    pub baq0: Vec<BlockQ8_0>,
+    pub baqk: Vec<BlockQ8_K>,
 }
 
 impl State {
-    /// Allocate buffers for a context of `ctx` tokens. Large buffers are
+    /// Allocate buffers for a context of `ctx` tokens, `n_threads` workers
+    /// and prompt batches of up to `max_batch` tokens. Large buffers are
     /// zero-initialised lazily by the allocator, so this is cheap.
-    pub fn new(d: &Dims, ctx: usize, rope_freq_factors: Option<&[f32]>) -> State {
+    pub fn new(d: &Dims, ctx: usize, rope_freq_factors: Option<&[f32]>, n_threads: usize, max_batch: usize) -> State {
+        let max_batch = max_batch.max(1);
+        let b = if max_batch > 1 { max_batch } else { 0 };
         let half = d.rot_dim / 2;
         let mut inv_freq = Vec::with_capacity(half);
         for i in 0..half {
@@ -172,13 +189,25 @@ impl State {
             hb: vec![0.0; d.hidden],
             hb2: vec![0.0; d.hidden],
             logits: vec![0.0; d.vocab],
-            scores: vec![0.0; d.n_head * ctx],
+            scores: vec![0.0; d.n_head.max(n_threads) * ctx],
             k_cache: vec![0.0; d.n_layer * ctx * d.kv_dim()],
             v_cache: vec![0.0; d.n_layer * ctx * d.kv_dim()],
             aq0: Vec::new(),
             aqk: Vec::new(),
             inv_freq,
             rope_cs: vec![0.0; d.rot_dim],
+            max_batch,
+            bx: vec![0.0; b * d.dim],
+            bxb: vec![0.0; b * d.dim],
+            bxb2: vec![0.0; b * d.dim],
+            bq: vec![0.0; b * d.q_dim()],
+            bk: vec![0.0; b * d.kv_dim()],
+            bv: vec![0.0; b * d.kv_dim()],
+            bhb: vec![0.0; b * d.hidden],
+            bhb2: vec![0.0; b * d.hidden],
+            brope_cs: vec![0.0; b * d.rot_dim],
+            baq0: Vec::new(),
+            baqk: Vec::new(),
         }
     }
 

@@ -227,6 +227,147 @@ pub unsafe fn dot_q6_k_q8_k(w: &[u8], x: &[BlockQ8_K]) -> f32 {
     sumf
 }
 
+// ---- 1x4 micro-kernels (one weight row, four activations); per-activation
+// arithmetic matches the single kernels exactly.
+
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_q4_0_q8_0_x4(w: &[u8], xs: [&[BlockQ8_0]; 4]) -> [f32; 4] {
+    let nb = xs[0].len();
+    debug_assert!(w.len() >= nb * Q4_0_SIZE);
+    let mut acc = [_mm256_setzero_ps(); 4];
+    let off = _mm256_set1_epi8(8);
+    let wp = w.as_ptr();
+    for i in 0..nb {
+        let b = wp.add(i * Q4_0_SIZE);
+        let d = f16_at(b);
+        let bx = _mm256_sub_epi8(nibbles_32(b.add(2)), off);
+        let ax = _mm256_sign_epi8(bx, bx);
+        for k in 0..4 {
+            let y = xs[k].get_unchecked(i);
+            let by = _mm256_loadu_si256(y.qs.as_ptr() as *const __m256i);
+            let sy = _mm256_sign_epi8(by, bx);
+            let p = _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), _mm256_set1_epi16(1)));
+            acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(d * y.d), p, acc[k]);
+        }
+    }
+    [hsum_f32(acc[0]), hsum_f32(acc[1]), hsum_f32(acc[2]), hsum_f32(acc[3])]
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_q8_0_q8_0_x4(w: &[u8], xs: [&[BlockQ8_0]; 4]) -> [f32; 4] {
+    let nb = xs[0].len();
+    debug_assert!(w.len() >= nb * Q8_0_SIZE);
+    let mut acc = [_mm256_setzero_ps(); 4];
+    let wp = w.as_ptr();
+    for i in 0..nb {
+        let b = wp.add(i * Q8_0_SIZE);
+        let d = f16_at(b);
+        let bx = _mm256_loadu_si256(b.add(2) as *const __m256i);
+        let ax = _mm256_sign_epi8(bx, bx);
+        for k in 0..4 {
+            let y = xs[k].get_unchecked(i);
+            let by = _mm256_loadu_si256(y.qs.as_ptr() as *const __m256i);
+            let sy = _mm256_sign_epi8(by, bx);
+            let p = _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), _mm256_set1_epi16(1)));
+            acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(d * y.d), p, acc[k]);
+        }
+    }
+    [hsum_f32(acc[0]), hsum_f32(acc[1]), hsum_f32(acc[2]), hsum_f32(acc[3])]
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_q4_k_q8_k_x4(w: &[u8], xs: [&[BlockQ8_K]; 4]) -> [f32; 4] {
+    let nb = xs[0].len();
+    debug_assert!(w.len() >= nb * Q4_K_SIZE);
+    let m4 = _mm256_set1_epi8(0x0F);
+    let mut sumf = [0f32; 4];
+    for i in 0..nb {
+        let b = w.as_ptr().add(i * Q4_K_SIZE);
+        let d = f16_at(b);
+        let dmin = f16_at(b.add(2));
+        let s = std::slice::from_raw_parts(b.add(4), 12);
+        let mut sc = [0i16; 8];
+        let mut mn = [0i32; 8];
+        for j in 0..8 {
+            let (a, m) = scale_min_k4(j, s);
+            sc[j] = a as i16;
+            mn[j] = m as i32;
+        }
+        let qs = b.add(16);
+        let mut sumi = [_mm256_setzero_si256(); 4];
+        for j in 0..4 {
+            let q = _mm256_loadu_si256(qs.add(32 * j) as *const __m256i);
+            let lo = _mm256_and_si256(q, m4);
+            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(q), m4);
+            let s0 = _mm256_set1_epi16(sc[2 * j]);
+            let s1 = _mm256_set1_epi16(sc[2 * j + 1]);
+            for k in 0..4 {
+                let yp = xs[k].get_unchecked(i).qs.as_ptr();
+                let y0 = _mm256_loadu_si256(yp.add(64 * j) as *const __m256i);
+                let y1 = _mm256_loadu_si256(yp.add(64 * j + 32) as *const __m256i);
+                let p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, y0), s0);
+                let p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, y1), s1);
+                sumi[k] = _mm256_add_epi32(sumi[k], _mm256_add_epi32(p0, p1));
+            }
+        }
+        for k in 0..4 {
+            let y = xs[k].get_unchecked(i);
+            let mut summ = 0i32;
+            for j in 0..8 {
+                summ += mn[j] * (y.bsums[2 * j] as i32 + y.bsums[2 * j + 1] as i32);
+            }
+            sumf[k] += (d * y.d) * hsum_i32(sumi[k]) as f32 - (dmin * y.d) * summ as f32;
+        }
+    }
+    sumf
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_q6_k_q8_k_x4(w: &[u8], xs: [&[BlockQ8_K]; 4]) -> [f32; 4] {
+    let nb = xs[0].len();
+    debug_assert!(w.len() >= nb * Q6_K_SIZE);
+    let m4 = _mm256_set1_epi8(0x0F);
+    let m30 = _mm256_set1_epi8(0x30);
+    let mut sumf = [0f32; 4];
+    for i in 0..nb {
+        let b = w.as_ptr().add(i * Q6_K_SIZE);
+        let d = f16_at(b.add(208));
+        let scales = std::slice::from_raw_parts(b.add(192) as *const i8, 16);
+        let mut sumi = [_mm256_setzero_si256(); 4];
+        for n in 0..2 {
+            let ql = b.add(64 * n);
+            let qh = b.add(128 + 32 * n);
+            let sc = &scales[8 * n..8 * n + 8];
+            let ql0 = _mm256_loadu_si256(ql as *const __m256i);
+            let ql32 = _mm256_loadu_si256(ql.add(32) as *const __m256i);
+            let qhv = _mm256_loadu_si256(qh as *const __m256i);
+            let qv = [
+                _mm256_or_si256(_mm256_and_si256(ql0, m4), _mm256_and_si256(_mm256_slli_epi16::<4>(qhv), m30)),
+                _mm256_or_si256(_mm256_and_si256(ql32, m4), _mm256_and_si256(_mm256_slli_epi16::<2>(qhv), m30)),
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16::<4>(ql0), m4), _mm256_and_si256(qhv, m30)),
+                _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16::<4>(ql32), m4), _mm256_and_si256(_mm256_srli_epi16::<2>(qhv), m30)),
+            ];
+            for (kq, q) in qv.iter().enumerate() {
+                let scv = _mm256_set_m128i(_mm_set1_epi16(sc[2 * kq + 1] as i16), _mm_set1_epi16(sc[2 * kq] as i16));
+                for k in 0..4 {
+                    let yp = xs[k].get_unchecked(i).qs.as_ptr().add(128 * n);
+                    let yv = _mm256_loadu_si256(yp.add(32 * kq) as *const __m256i);
+                    sumi[k] = _mm256_add_epi32(sumi[k], _mm256_madd_epi16(_mm256_maddubs_epi16(*q, yv), scv));
+                }
+            }
+        }
+        for k in 0..4 {
+            let y = xs[k].get_unchecked(i);
+            let mut bias = 0i32;
+            for j in 0..16 {
+                bias += scales[j] as i32 * y.bsums[j] as i32;
+            }
+            sumf[k] += (d * y.d) * (hsum_i32(sumi[k]) - 32 * bias) as f32;
+        }
+    }
+    sumf
+}
+
 #[target_feature(enable = "avx2,fma,f16c")]
 pub unsafe fn dot_f16_f32(w: &[u8], x: &[f32]) -> f32 {
     let n = x.len();
@@ -300,6 +441,23 @@ macro_rules! safe_wrappers {
     };
 }
 
+macro_rules! safe_wrappers_x4 {
+    ($($name:ident = $path:path : $xt:ty;)*) => {
+        $( fn $name(w: &[u8], xs: [&[$xt]; 4]) -> [f32; 4] {
+            // SAFETY: only reachable through a kernel table whose selection
+            // checked the required CPU features at runtime.
+            unsafe { $path(w, xs) }
+        } )*
+    };
+}
+
+safe_wrappers_x4! {
+    s_q4_0_x4 = dot_q4_0_q8_0_x4 : BlockQ8_0;
+    s_q8_0_x4 = dot_q8_0_q8_0_x4 : BlockQ8_0;
+    s_q4_k_x4 = dot_q4_k_q8_k_x4 : BlockQ8_K;
+    s_q6_k_x4 = dot_q6_k_q8_k_x4 : BlockQ8_K;
+}
+
 safe_wrappers! {
     s_q4_0 = dot_q4_0_q8_0 : BlockQ8_0;
     s_q8_0 = dot_q8_0_q8_0 : BlockQ8_0;
@@ -322,6 +480,10 @@ pub const KERNELS: super::Kernels = super::Kernels {
     f16_f32: super::scalar::dot_f16_f32,
     bf16_f32: s_bf16,
     f32_f32: s_f32,
+    q4_0_q8_0_x4: Some(s_q4_0_x4),
+    q8_0_q8_0_x4: Some(s_q8_0_x4),
+    q4_k_q8_k_x4: Some(s_q4_k_x4),
+    q6_k_q8_k_x4: Some(s_q6_k_x4),
 };
 
 /// AVX2 + FMA + F16C kernels.
@@ -335,4 +497,8 @@ pub const KERNELS_F16C: super::Kernels = super::Kernels {
     f16_f32: s_f16,
     bf16_f32: s_bf16,
     f32_f32: s_f32,
+    q4_0_q8_0_x4: Some(s_q4_0_x4),
+    q8_0_q8_0_x4: Some(s_q8_0_x4),
+    q4_k_q8_k_x4: Some(s_q4_k_x4),
+    q6_k_q8_k_x4: Some(s_q6_k_x4),
 };

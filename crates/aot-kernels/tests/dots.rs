@@ -160,3 +160,103 @@ fn matvec_parallel_matches_serial() {
         assert!((out1[r] - fref).abs() < 0.5, "row {r}: {} vs {fref}", out1[r]);
     }
 }
+
+/// The 1x4 micro-kernels must agree bit-for-bit with four single dots.
+#[test]
+fn x4_kernels_match_single() {
+    let cols = 2048;
+    let mut rng = Rng(777);
+    for k in all_kernel_sets() {
+        for kind in [Kind::Q4_0, Kind::Q8_0, Kind::Q4_K, Kind::Q6_K] {
+            let w: Vec<f32> = (0..cols).map(|_| rng.f()).collect();
+            let wq = quantize_row(kind, &w);
+            let xs: Vec<Vec<f32>> = (0..4).map(|_| (0..cols).map(|_| rng.f() * 2.0).collect()).collect();
+            if kind.block_size() == QK8_0 {
+                let mut q: Vec<Vec<BlockQ8_0>> = vec![Vec::new(); 4];
+                for i in 0..4 {
+                    quantize_q8_0(&xs[i], &mut q[i]);
+                }
+                let (dot, dot4) = match kind {
+                    Kind::Q4_0 => (k.q4_0_q8_0, k.q4_0_q8_0_x4),
+                    _ => (k.q8_0_q8_0, k.q8_0_q8_0_x4),
+                };
+                if let Some(d4) = dot4 {
+                    let got = d4(&wq, [&q[0], &q[1], &q[2], &q[3]]);
+                    for i in 0..4 {
+                        assert_eq!(got[i].to_bits(), dot(&wq, &q[i]).to_bits(), "{kind:?} {} lane {i}", k.name);
+                    }
+                }
+            } else {
+                let mut q: Vec<Vec<BlockQ8_K>> = vec![Vec::new(); 4];
+                for i in 0..4 {
+                    quantize_q8_k(&xs[i], &mut q[i]);
+                }
+                let (dot, dot4) = match kind {
+                    Kind::Q4_K => (k.q4_k_q8_k, k.q4_k_q8_k_x4),
+                    _ => (k.q6_k_q8_k, k.q6_k_q8_k_x4),
+                };
+                if let Some(d4) = dot4 {
+                    let got = d4(&wq, [&q[0], &q[1], &q[2], &q[3]]);
+                    for i in 0..4 {
+                        assert_eq!(got[i].to_bits(), dot(&wq, &q[i]).to_bits(), "{kind:?} {} lane {i}", k.name);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Batched matmul (row blocks + micro-kernels) equals per-row matvec exactly.
+#[test]
+fn matmul_matches_matvec_bitwise() {
+    let rows = 37;
+    let cols = 512;
+    let mut rng = Rng(4242);
+    let pool = Pool::new(3);
+    for kind in [Kind::Q4_0, Kind::Q8_0, Kind::Q4_K, Kind::Q5_K, Kind::Q6_K, Kind::F16] {
+        let w: Vec<Vec<f32>> = (0..rows).map(|_| (0..cols).map(|_| rng.f()).collect()).collect();
+        let wq: Vec<u8> = w.iter().flat_map(|r| quantize_row(kind, r)).collect();
+        for m in [1usize, 3, 4, 7, 9] {
+            let xs: Vec<f32> = (0..m * cols).map(|_| rng.f()).collect();
+            let mut batched = vec![0f32; m * rows];
+            let mut single = vec![0f32; rows];
+            match kind {
+                Kind::Q4_0 | Kind::Q8_0 => {
+                    let mut q = Vec::new();
+                    quantize_q8_0(&xs, &mut q);
+                    if kind == Kind::Q4_0 { matvec::matmul_q4_0(&pool, &mut batched, &wq, &q, m, rows, cols) } else { matvec::matmul_q8_0(&pool, &mut batched, &wq, &q, m, rows, cols) }
+                    for i in 0..m {
+                        let xi = &q[i * cols / 32..(i + 1) * cols / 32];
+                        if kind == Kind::Q4_0 { matvec::matvec_q4_0(&pool, &mut single, &wq, xi, rows, cols) } else { matvec::matvec_q8_0(&pool, &mut single, &wq, xi, rows, cols) }
+                        assert!(single.iter().zip(&batched[i * rows..(i + 1) * rows]).all(|(a, b)| a.to_bits() == b.to_bits()), "{kind:?} m={m} row set {i}");
+                    }
+                }
+                Kind::F16 => {
+                    matvec::matmul_f16(&pool, &mut batched, &wq, &xs, m, rows, cols);
+                    for i in 0..m {
+                        matvec::matvec_f16(&pool, &mut single, &wq, &xs[i * cols..(i + 1) * cols], rows, cols);
+                        assert!(single.iter().zip(&batched[i * rows..(i + 1) * rows]).all(|(a, b)| a.to_bits() == b.to_bits()), "{kind:?} m={m} row set {i}");
+                    }
+                }
+                _ => {
+                    let mut q = Vec::new();
+                    quantize_q8_k(&xs, &mut q);
+                    match kind {
+                        Kind::Q4_K => matvec::matmul_q4_k(&pool, &mut batched, &wq, &q, m, rows, cols),
+                        Kind::Q5_K => matvec::matmul_q5_k(&pool, &mut batched, &wq, &q, m, rows, cols),
+                        _ => matvec::matmul_q6_k(&pool, &mut batched, &wq, &q, m, rows, cols),
+                    }
+                    for i in 0..m {
+                        let xi = &q[i * cols / 256..(i + 1) * cols / 256];
+                        match kind {
+                            Kind::Q4_K => matvec::matvec_q4_k(&pool, &mut single, &wq, xi, rows, cols),
+                            Kind::Q5_K => matvec::matvec_q5_k(&pool, &mut single, &wq, xi, rows, cols),
+                            _ => matvec::matvec_q6_k(&pool, &mut single, &wq, xi, rows, cols),
+                        }
+                        assert!(single.iter().zip(&batched[i * rows..(i + 1) * rows]).all(|(a, b)| a.to_bits() == b.to_bits()), "{kind:?} m={m} row set {i}");
+                    }
+                }
+            }
+        }
+    }
+}

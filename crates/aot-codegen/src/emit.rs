@@ -78,6 +78,87 @@ fn emit_quantize(out: &mut String, src: &str, kinds: impl Iterator<Item = Kind>)
     }
 }
 
+/// Batched activation quantization over `m` rows of `src` (row length `n`).
+fn emit_quantize_rows(out: &mut String, src: &str, n: usize, kinds: impl Iterator<Item = Kind>) {
+    let acts: BTreeSet<Activation> = kinds.map(Kind::activation).collect();
+    for a in acts {
+        match a {
+            Activation::Q8_0 => writeln!(out, "    quantize_q8_0(&s.{src}[..m * {n}], &mut s.baq0);").unwrap(),
+            Activation::Q8_K => writeln!(out, "    quantize_q8_k(&s.{src}[..m * {n}], &mut s.baqk);").unwrap(),
+            Activation::F32 => {}
+        }
+    }
+}
+
+fn bact_expr(a: Activation, src: &str, n: usize) -> String {
+    match a {
+        Activation::Q8_0 => "&s.baq0".into(),
+        Activation::Q8_K => "&s.baqk".into(),
+        Activation::F32 => format!("&s.{src}[..m * {n}]"),
+    }
+}
+
+fn emit_matmul(out: &mut String, t: &TensorSpec, texpr: &str, dst: &str, src: &str) {
+    writeln!(
+        out,
+        "    matmul_{}(pool, &mut s.{dst}, w.bytes(&{texpr}), {}, m, {}, {});",
+        t.kind.fn_suffix(),
+        bact_expr(t.kind.activation(), src, t.cols),
+        t.rows,
+        t.cols
+    )
+    .unwrap();
+}
+
+fn emit_layer_batch(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec) {
+    let d = &spec.dims;
+    let (dim, hidden, qd, kvd) = (d.dim, d.hidden, d.n_head * d.head_dim, d.n_kv_head * d.head_dim);
+    writeln!(out, "/// Transformer block {i} over `m` consecutive prompt tokens starting at `pos0`.").unwrap();
+    writeln!(out, "#[inline(never)]").unwrap();
+    writeln!(out, "fn layer_{i}_batch(s: &mut State, w: &Weights, pool: &Pool, pos0: usize, m: usize) {{").unwrap();
+    writeln!(out, "    let l = &LAYERS[{i}];").unwrap();
+    writeln!(out, "    rmsnorm_rows(&mut s.bxb, &s.bx, w.f32s(&l.attn_norm), DIMS.eps, m);").unwrap();
+    emit_quantize_rows(out, "bxb", dim, [l.wq.kind, l.wk.kind, l.wv.kind].into_iter());
+    emit_matmul(out, &l.wq, "l.wq", "bq", "bxb");
+    emit_matmul(out, &l.wk, "l.wk", "bk", "bxb");
+    emit_matmul(out, &l.wv, "l.wv", "bv", "bxb");
+    writeln!(out, "    rope_rows(&mut s.bq, m, {}, {}, {}, &s.brope_cs);", d.n_head, d.head_dim, d.rot_dim).unwrap();
+    writeln!(out, "    rope_rows(&mut s.bk, m, {}, {}, {}, &s.brope_cs);", d.n_kv_head, d.head_dim, d.rot_dim).unwrap();
+    writeln!(out, "    store_kv_rows(&mut s.k_cache, &mut s.v_cache, &s.bk, &s.bv, &DIMS, s.ctx, {i}, pos0, m);").unwrap();
+    writeln!(out, "    attention_rows(pool, &mut s.bxb, &s.bq, &s.k_cache, &s.v_cache, &mut s.scores, &DIMS, s.ctx, {i}, pos0, m);").unwrap();
+    emit_quantize_rows(out, "bxb", qd, [l.wo.kind].into_iter());
+    emit_matmul(out, &l.wo, "l.wo", "bxb2", "bxb");
+    writeln!(out, "    add_inplace(&mut s.bx[..m * {dim}], &s.bxb2[..m * {dim}]);").unwrap();
+    writeln!(out, "    rmsnorm_rows(&mut s.bxb, &s.bx, w.f32s(&l.ffn_norm), DIMS.eps, m);").unwrap();
+    emit_quantize_rows(out, "bxb", dim, [l.gate.kind, l.up.kind].into_iter());
+    let fused = l.gate.kind == l.up.kind && l.gate.kind.activation() != Activation::F32;
+    if fused {
+        let (fn_name, dot_fn, dot4_fn) = match l.gate.kind.activation() {
+            Activation::Q8_K => ("matmul2_q8_k_input", "dot_fn_q8_k", "dot4_fn_q8_k"),
+            _ => ("matmul2_q8_0_input", "dot_fn_q8_0", "dot4_fn_q8_0"),
+        };
+        let kn = l.gate.kind.rust_name();
+        writeln!(
+            out,
+            "    {fn_name}(pool, &mut s.bhb, &mut s.bhb2, w.bytes(&l.gate), w.bytes(&l.up), {}, m, {}, Kind::{kn}.row_bytes({}), {dot_fn}(Kind::{kn}), {dot4_fn}(Kind::{kn}));",
+            bact_expr(l.gate.kind.activation(), "bxb", dim),
+            l.gate.rows,
+            l.gate.cols,
+        )
+        .unwrap();
+    } else {
+        emit_matmul(out, &l.gate, "l.gate", "bhb", "bxb");
+        emit_matmul(out, &l.up, "l.up", "bhb2", "bxb");
+    }
+    writeln!(out, "    silu_mul(&mut s.bhb[..m * {hidden}], &s.bhb2[..m * {hidden}]);").unwrap();
+    emit_quantize_rows(out, "bhb", hidden, [l.down.kind].into_iter());
+    emit_matmul(out, &l.down, "l.down", "bxb2", "bhb");
+    writeln!(out, "    add_inplace(&mut s.bx[..m * {dim}], &s.bxb2[..m * {dim}]);").unwrap();
+    let _ = kvd;
+    writeln!(out, "}}
+").unwrap();
+}
+
 fn emit_matvec(out: &mut String, t: &TensorSpec, texpr: &str, dst: &str, src: &str) {
     writeln!(
         out,
@@ -220,6 +301,9 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     for (i, l) in spec.layers.iter().enumerate() {
         emit_layer(&mut o, i, l, spec);
     }
+    for (i, l) in spec.layers.iter().enumerate() {
+        emit_layer_batch(&mut o, i, l, spec);
+    }
 
     let out_t = spec.output.as_ref().unwrap_or(&spec.token_embd);
     writeln!(o, "/// One decoding step: feeds `token` at `pos` through every block and,").unwrap();
@@ -236,6 +320,30 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "        return;").unwrap();
     writeln!(o, "    }}").unwrap();
     writeln!(o, "    rmsnorm(&mut s.xb, &s.x, w.f32s(&OUTPUT_NORM), DIMS.eps);").unwrap();
+    emit_quantize(&mut o, "xb", [out_t.kind].into_iter());
+    emit_matvec(&mut o, out_t, "OUTPUT", "logits", "xb");
+    writeln!(o, "}}\n").unwrap();
+
+    writeln!(o, "/// Batched prompt step: processes `tokens` at positions `pos0 ..` through every").unwrap();
+    writeln!(o, "/// block, reading each weight row once for all of them, and computes the").unwrap();
+    writeln!(o, "/// logits of the last token when `want_logits` is set.").unwrap();
+    writeln!(o, "pub fn forward_batch(s: &mut State, w: &Weights, pool: &Pool, tokens: &[u32], pos0: usize, want_logits: bool) {{").unwrap();
+    writeln!(o, "    let m = tokens.len();").unwrap();
+    writeln!(o, "    assert!(m >= 1 && m <= s.max_batch, \"batch size out of range\");").unwrap();
+    writeln!(o, "    assert!(pos0 + m <= s.ctx, \"positions exceed the context\");").unwrap();
+    writeln!(o, "    for (i, &t) in tokens.iter().enumerate() {{").unwrap();
+    writeln!(o, "        assert!((t as usize) < DIMS.vocab, \"token id out of range\");").unwrap();
+    writeln!(o, "        dequant_row_{}(w.row(&TOKEN_EMBD, t as usize), &mut s.bx[i * {dim}..(i + 1) * {dim}]);", spec.token_embd.kind.fn_suffix(), dim = d.dim).unwrap();
+    writeln!(o, "    }}").unwrap();
+    writeln!(o, "    rope_cos_sin_rows(&mut s.brope_cs, &s.inv_freq, pos0, m, DIMS.rope_scale);").unwrap();
+    for i in 0..d.n_layer {
+        writeln!(o, "    layer_{i}_batch(s, w, pool, pos0, m);").unwrap();
+    }
+    writeln!(o, "    if !want_logits {{").unwrap();
+    writeln!(o, "        return;").unwrap();
+    writeln!(o, "    }}").unwrap();
+    writeln!(o, "    let last = (m - 1) * {dim};", dim = d.dim).unwrap();
+    writeln!(o, "    rmsnorm(&mut s.xb, &s.bx[last..last + {dim}], w.f32s(&OUTPUT_NORM), DIMS.eps);", dim = d.dim).unwrap();
     emit_quantize(&mut o, "xb", [out_t.kind].into_iter());
     emit_matvec(&mut o, out_t, "OUTPUT", "logits", "xb");
     writeln!(o, "}}").unwrap();
@@ -320,6 +428,7 @@ pub fn emit_main_rs(spec: &ModelSpec) -> String {
          \x20       dims: &model::DIMS,\n\
          \x20       info: &model::INFO,\n\
          \x20       forward: model::forward,\n\
+         \x20       forward_batch: model::forward_batch,\n\
          \x20       rope_freqs: model::ROPE_FREQS,\n\
          \x20       tokenizer_blob: payload::tokenizer(),\n\
          \x20       weights: payload::weights,\n\

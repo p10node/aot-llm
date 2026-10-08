@@ -56,7 +56,7 @@ aot-llm is about **first-response latency and packaging**, not raw throughput. S
 Requirements: Rust 1.98+ (the kernels use `vdotq_s32`), a Llama-architecture GGUF (TinyLlama, Llama 2/3/3.2, Mistral 7B, ...).
 
 ```bash
-git clone https://github.com/pierreneter/aot-llm && cd aot-llm
+git clone https://github.com/p10node/aot-llm && cd aot-llm
 cargo build --release
 
 # Inspect what will be compiled

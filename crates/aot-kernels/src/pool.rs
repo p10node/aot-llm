@@ -164,6 +164,7 @@ impl<T> SendPtr<T> {
     /// `range` must lie within the original buffer and be disjoint from the
     /// ranges used by other threads.
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn slice_mut(&self, range: std::ops::Range<usize>) -> &mut [T] {
         std::slice::from_raw_parts_mut(self.0.add(range.start), range.end - range.start)
     }

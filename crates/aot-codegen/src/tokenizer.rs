@@ -113,7 +113,7 @@ impl Blob {
         self.buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
     }
     fn align(&mut self) {
-        while self.buf.len() % 4 != 0 {
+        while !self.buf.len().is_multiple_of(4) {
             self.buf.push(0);
         }
     }
@@ -226,7 +226,7 @@ pub fn build_blob(g: &GgufFile) -> Result<(Vec<u8>, TokenizerSummary)> {
                 }
             }
         }
-        if byte_tokens.iter().any(|&v| v == NONE) {
+        if byte_tokens.contains(&NONE) {
             warnings.push("vocabulary has no complete <0xNN> byte fallback set".into());
         }
     }

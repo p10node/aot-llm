@@ -78,6 +78,7 @@ pub fn add_inplace(x: &mut [f32], y: &[f32]) {
 }
 
 /// Copy the current key/value vectors into the cache at `(layer, pos)`.
+#[allow(clippy::too_many_arguments)]
 pub fn store_kv(k_cache: &mut [f32], v_cache: &mut [f32], k: &[f32], v: &[f32], d: &Dims, ctx: usize, layer: usize, pos: usize) {
     let kv = d.kv_dim();
     let at = (layer * ctx + pos) * kv;

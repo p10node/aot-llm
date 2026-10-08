@@ -89,14 +89,16 @@ fn main() -> Result<()> {
     }
 }
 
+/// Binary units (MiB-based), matching the statistics printed by generated binaries.
 fn human(bytes: u64) -> String {
     let b = bytes as f64;
-    if b >= 1e9 {
-        format!("{:.2} GB", b / 1e9)
-    } else if b >= 1e6 {
-        format!("{:.1} MB", b / 1e6)
-    } else if b >= 1e3 {
-        format!("{:.1} KB", b / 1e3)
+    const K: f64 = 1024.0;
+    if b >= K * K * K {
+        format!("{:.2} GB", b / (K * K * K))
+    } else if b >= K * K {
+        format!("{:.1} MB", b / (K * K))
+    } else if b >= K {
+        format!("{:.1} KB", b / K)
     } else {
         format!("{bytes} B")
     }
@@ -154,7 +156,7 @@ fn compile(
         PathBuf::from(s)
     });
     let crate_name = name.unwrap_or_else(|| crate_name_from(&output.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
-    let opts = EmitOptions { crate_name: crate_name.clone(), sidecar, native, gguf_path: model.clone(), compiler_version: aot_codegen::VERSION.to_string() };
+    let opts = EmitOptions { crate_name: crate_name.clone(), sidecar, native, gguf_path: model.clone(), compiler_version: aot_codegen::VERSION.to_string(), target: target.clone() };
     write_project(&dir, &spec, &blob, &opts).with_context(|| format!("writing project to {}", dir.display()))?;
     eprintln!("[3/4] generated project in {} (crate `{crate_name}`, {} layers unrolled, weights {})", dir.display(), d.n_layer, if sidecar { "sidecar" } else { "embedded" });
     if emit_only {
@@ -202,7 +204,7 @@ fn summarise(v: &MetaValue) -> String {
         MetaValue::F32(f) => format!("{f}"),
         MetaValue::F64(f) => format!("{f}"),
         MetaValue::Bool(b) => format!("{b}"),
-        other => format!("{}", other.as_u64().map(|v| v.to_string()).unwrap_or_else(|| format!("{other:?}"))),
+        other => other.as_u64().map(|v| v.to_string()).unwrap_or_else(|| format!("{other:?}")).to_string(),
     }
 }
 

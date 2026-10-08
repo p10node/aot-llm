@@ -11,3 +11,6 @@ rust-version.workspace = true
 aot-gguf = { path = "../aot-gguf" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+aot-kernels = { path = "../aot-kernels" }

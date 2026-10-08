@@ -16,7 +16,7 @@ fn nearest(x: f32) -> i32 {
 pub fn quantize_row_q4_0(x: &[f32]) -> Vec<u8> {
     assert_eq!(x.len() % QK8_0, 0);
     let mut out = Vec::with_capacity(x.len() / QK8_0 * Q4_0_SIZE);
-    for blk in x.chunks_exact(QK8_0) {
+    for blk in x.as_chunks::<QK8_0>().0 {
         // ggml picks the value with the largest magnitude (signed) and maps it
         // to -8, which uses the full asymmetric range of the nibble.
         let mut amax = 0f32;
@@ -43,7 +43,7 @@ pub fn quantize_row_q4_0(x: &[f32]) -> Vec<u8> {
 pub fn quantize_row_q8_0(x: &[f32]) -> Vec<u8> {
     assert_eq!(x.len() % QK8_0, 0);
     let mut out = Vec::with_capacity(x.len() / QK8_0 * Q8_0_SIZE);
-    for blk in x.chunks_exact(QK8_0) {
+    for blk in x.as_chunks::<QK8_0>().0 {
         let amax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
         let d = amax / 127.0;
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
@@ -126,7 +126,7 @@ fn encode_k4_block(blk: &[f32], qmax: f32) -> (f32, f32, [u8; 12], [u8; QK_K]) {
 pub fn quantize_row_q4_k(x: &[f32]) -> Vec<u8> {
     assert_eq!(x.len() % QK_K, 0);
     let mut out = Vec::with_capacity(x.len() / QK_K * Q4_K_SIZE);
-    for blk in x.chunks_exact(QK_K) {
+    for blk in x.as_chunks::<QK_K>().0 {
         let (d, dmin, scales, q) = encode_k4_block(blk, 15.0);
         out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
         out.extend_from_slice(&f32_to_f16(dmin).to_le_bytes());
@@ -144,7 +144,7 @@ pub fn quantize_row_q4_k(x: &[f32]) -> Vec<u8> {
 pub fn quantize_row_q5_k(x: &[f32]) -> Vec<u8> {
     assert_eq!(x.len() % QK_K, 0);
     let mut out = Vec::with_capacity(x.len() / QK_K * Q5_K_SIZE);
-    for blk in x.chunks_exact(QK_K) {
+    for blk in x.as_chunks::<QK_K>().0 {
         let (d, dmin, scales, q) = encode_k4_block(blk, 31.0);
         out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
         out.extend_from_slice(&f32_to_f16(dmin).to_le_bytes());
@@ -176,7 +176,7 @@ pub fn quantize_row_q5_k(x: &[f32]) -> Vec<u8> {
 pub fn quantize_row_q6_k(x: &[f32]) -> Vec<u8> {
     assert_eq!(x.len() % QK_K, 0);
     let mut out = Vec::with_capacity(x.len() / QK_K * Q6_K_SIZE);
-    for blk in x.chunks_exact(QK_K) {
+    for blk in x.as_chunks::<QK_K>().0 {
         // One symmetric scale per 16 values, q in -32..=31.
         let mut scales = [0f32; 16];
         for j in 0..16 {

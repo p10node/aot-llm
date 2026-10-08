@@ -170,7 +170,7 @@ fn tensor_spec(t: &TensorInfo) -> Result<TensorSpec> {
     let kind = Kind::from_ggml(t.ty)
         .ok_or_else(|| anyhow!("tensor {} uses unsupported type {}; supported: f32, f16, bf16, q4_0, q8_0, q4_K, q5_K, q6_K", t.name, t.ty))?;
     let cols = t.cols() as usize;
-    if cols % kind.block_size() != 0 {
+    if !cols.is_multiple_of(kind.block_size()) {
         bail!("tensor {}: inner dimension {cols} is not a multiple of the {} block size", t.name, kind.ggml_name());
     }
     Ok(TensorSpec { name: t.name.clone(), kind, off: t.offset, len: t.n_bytes(), rows: t.rows() as usize, cols })
@@ -225,10 +225,10 @@ impl ModelSpec {
                 other => warnings.push(format!("rope scaling type \"{other}\" (factor {factor}) is not supported; positions are used unscaled")),
             }
         }
-        if n_head % n_kv_head != 0 {
+        if !n_head.is_multiple_of(n_kv_head) {
             bail!("head_count {n_head} is not a multiple of head_count_kv {n_kv_head}");
         }
-        if rot_dim > head_dim || rot_dim % 2 != 0 {
+        if rot_dim > head_dim || !rot_dim.is_multiple_of(2) {
             bail!("invalid rope dimension count {rot_dim} for head_dim {head_dim}");
         }
         let vocab = match g.get("tokenizer.ggml.tokens").and_then(|v| v.as_array()) {

@@ -51,6 +51,7 @@ struct Args {
     info: bool,
     show_special: bool,
     tokens_only: bool,
+    dump_logits: bool,
 }
 
 const USAGE: &str = "\
@@ -74,6 +75,7 @@ Options:
       --weights PATH       Sidecar weights file (sidecar builds only)
       --show-special       Print special tokens
       --tokens             Print token ids instead of text
+      --dump-logits        Print the logits of the last prompt token and exit
   -q, --quiet              Do not print statistics to stderr
       --info               Print model information and exit
   -h, --help               Show this help
@@ -96,6 +98,7 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
         info: false,
         show_special: false,
         tokens_only: false,
+        dump_logits: false,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -123,6 +126,7 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
             "--weights" => a.weights_path = Some(PathBuf::from(next(&mut i, f)?)),
             "--show-special" => a.show_special = true,
             "--tokens" => a.tokens_only = true,
+            "--dump-logits" => a.dump_logits = true,
             "-q" | "--quiet" => a.quiet = true,
             "--info" => a.info = true,
             "-h" | "--help" => {
@@ -151,19 +155,21 @@ fn mb(b: u64) -> f64 {
 }
 
 fn print_info(rt: &Runtime) {
+    // Ignore write errors (e.g. a closed pipe) instead of panicking.
+    let mut o = std::io::stdout().lock();
     let d = rt.dims;
     let tok = Tokenizer::new(rt.tokenizer_blob).ok();
-    println!("model:        {}", rt.info.name);
-    println!("source:       {}", rt.info.source);
-    println!("architecture: {}", rt.info.arch);
-    println!("file type:    {}", rt.info.file_type);
-    println!("parameters:   {:.3} B", rt.info.n_params as f64 / 1e9);
-    println!("tensors:      {} ({})", rt.info.n_tensors, rt.info.quant_mix);
-    println!("weights:      {:.1} MB ({})", mb(rt.info.weights_len as u64), if rt.sidecar { "sidecar file" } else { "embedded in executable" });
-    println!("dim={} hidden={} layers={} heads={} kv_heads={} head_dim={} vocab={} ctx_train={}", d.dim, d.hidden, d.n_layer, d.n_head, d.n_kv_head, d.head_dim, d.vocab, d.n_ctx_train);
-    println!("rope: base={} rot_dim={} scale={} freq_factors={}", d.rope_base, d.rot_dim, d.rope_scale, rt.rope_freqs.is_some());
+    let _ = writeln!(o, "model:        {}", rt.info.name);
+    let _ = writeln!(o, "source:       {}", rt.info.source);
+    let _ = writeln!(o, "architecture: {}", rt.info.arch);
+    let _ = writeln!(o, "file type:    {}", rt.info.file_type);
+    let _ = writeln!(o, "parameters:   {:.3} B", rt.info.n_params as f64 / 1e9);
+    let _ = writeln!(o, "tensors:      {} ({})", rt.info.n_tensors, rt.info.quant_mix);
+    let _ = writeln!(o, "weights:      {:.1} MB ({})", mb(rt.info.weights_len as u64), if rt.sidecar { "sidecar file" } else { "embedded in executable" });
+    let _ = writeln!(o, "dim={} hidden={} layers={} heads={} kv_heads={} head_dim={} vocab={} ctx_train={}", d.dim, d.hidden, d.n_layer, d.n_head, d.n_kv_head, d.head_dim, d.vocab, d.n_ctx_train);
+    let _ = writeln!(o, "rope: base={} rot_dim={} scale={} freq_factors={}", d.rope_base, d.rot_dim, d.rope_scale, rt.rope_freqs.is_some());
     if let Some(t) = tok {
-        println!(
+        let _ = writeln!(o, 
             "tokenizer:    {} ({} tokens, {} merges, bos={:?} eos={:?} eot={:?}, chat template: {})",
             if t.is_spm() { "spm" } else { "bpe" },
             t.n_tokens(),
@@ -174,8 +180,8 @@ fn print_info(rt: &Runtime) {
             chat::name(t.chat_format())
         );
     }
-    println!("kernels:      {} ({} cores)", matvec::detect_kernels().name, default_threads());
-    println!("compiler:     aot-llm {}", rt.info.compiler_version);
+    let _ = writeln!(o, "kernels:      {} ({} cores)", matvec::detect_kernels().name, default_threads());
+    let _ = writeln!(o, "compiler:     aot-llm {}", rt.info.compiler_version);
 }
 
 /// Write complete UTF-8 characters from `buf` to `out`, keeping any trailing
@@ -241,7 +247,9 @@ pub fn main(rt: Runtime) -> i32 {
         }
     }
     let threads = args.threads.unwrap_or_else(default_threads).max(1);
+    let t_pool0 = Instant::now();
     let pool = Pool::new(threads);
+    let t_pool = t_pool0.elapsed();
 
     // Prompt.
     let raw = match &args.prompt {
@@ -267,7 +275,9 @@ pub fn main(rt: Runtime) -> i32 {
         raw
     };
     let add_bos = !args.no_bos && tok.add_bos();
+    let t_enc0 = Instant::now();
     let prompt = tok.encode(&text, add_bos, true);
+    let t_encode = t_enc0.elapsed();
     if prompt.is_empty() {
         eprintln!("error: empty prompt");
         return 2;
@@ -295,6 +305,15 @@ pub fn main(rt: Runtime) -> i32 {
         (rt.forward)(&mut state, &weights, &pool, t, i, i + 1 == prompt.len());
     }
     let t_prompt = t1.elapsed();
+
+    if args.dump_logits {
+        let mut line = String::with_capacity(state.logits.len() * 10);
+        for v in &state.logits {
+            line.push_str(&format!("{v:.6} "));
+        }
+        println!("{}", line.trim_end());
+        return 0;
+    }
 
     // Generation.
     let mut sampler = Sampler::new(args.sampler.clone());
@@ -342,8 +361,10 @@ pub fn main(rt: Runtime) -> i32 {
         let gs = t_gen.as_secs_f64();
         let gen_forwards = generated.saturating_sub(1).max(if generated > 0 { 1 } else { 0 });
         let mut line = format!(
-            "[aot-llm] startup {:.3} ms | prompt {} tok / {:.3} s ({:.1} tok/s) | gen {} tok / {:.3} s ({:.1} tok/s)",
+            "[aot-llm] startup {:.3} ms (threads {:.3}, tokenize {:.3}) | prompt {} tok / {:.3} s ({:.1} tok/s) | gen {} tok / {:.3} s ({:.1} tok/s)",
             t_ready.as_secs_f64() * 1e3,
+            t_pool.as_secs_f64() * 1e3,
+            t_encode.as_secs_f64() * 1e3,
             prompt.len(),
             ps,
             prompt.len() as f64 / ps.max(1e-9),
@@ -357,7 +378,7 @@ pub fn main(rt: Runtime) -> i32 {
         if let Some(rss) = weights::peak_rss_bytes() {
             line.push_str(&format!(" | peak RSS {:.0} MB", mb(rss)));
         }
-        line.push_str(&format!(" | {} threads | {} | ctx {}", threads, matvec::kernels().name, ctx));
+        line.push_str(&format!(" | {} threads | {} | ctx {}", threads, matvec::active_kernels().name, ctx));
         eprintln!("{line}");
     }
     0

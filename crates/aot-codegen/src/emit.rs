@@ -22,6 +22,8 @@ pub struct EmitOptions {
     /// Absolute path of the source GGUF (embedded with `.incbin`).
     pub gguf_path: PathBuf,
     pub compiler_version: String,
+    /// Target triple the project will be built for (affects cargo config).
+    pub target: Option<String>,
 }
 
 /// Turn an arbitrary string into a valid crate name.
@@ -340,6 +342,8 @@ pub fn emit_cargo_toml(opts: &EmitOptions) -> String {
          name = \"{name}\"\n\
          path = \"src/main.rs\"\n\n\
          [dependencies]\n\n\
+         # Standalone project even when generated inside another cargo workspace.\n\
+         [workspace]\n\n\
          [profile.release]\n\
          opt-level = 3\n\
          lto = \"fat\"\n\
@@ -372,6 +376,22 @@ pub fn emit_readme(spec: &ModelSpec, opts: &EmitOptions) -> String {
     )
 }
 
+/// Cargo configuration for the generated project: `target-cpu=native` on
+/// request, and self-contained static linking with `rust-lld` for musl
+/// targets so Linux binaries can be produced from any host.
+pub fn cargo_config(opts: &EmitOptions) -> String {
+    let mut c = String::new();
+    if opts.native {
+        c.push_str("[build]\nrustflags = [\"-C\", \"target-cpu=native\"]\n\n");
+    }
+    if let Some(t) = opts.target.as_deref().filter(|t| t.contains("-musl")) {
+        c.push_str(&format!(
+            "[target.{t}]\nlinker = \"rust-lld\"\nrustflags = [\"-C\", \"target-feature=+crt-static\", \"-C\", \"link-self-contained=yes\"]\n"
+        ));
+    }
+    c
+}
+
 /// Write the whole project into `dir` (created if needed).
 pub fn write_project(dir: &Path, spec: &ModelSpec, tokenizer_blob: &[u8], opts: &EmitOptions) -> Result<()> {
     let src = dir.join("src");
@@ -387,11 +407,12 @@ pub fn write_project(dir: &Path, spec: &ModelSpec, tokenizer_blob: &[u8], opts: 
         fs::write(rt.join(name), contents)?;
     }
     let cargo_dir = dir.join(".cargo");
-    if opts.native {
-        fs::create_dir_all(&cargo_dir)?;
-        fs::write(cargo_dir.join("config.toml"), "[build]\nrustflags = [\"-C\", \"target-cpu=native\"]\n")?;
-    } else if cargo_dir.exists() {
+    let config = cargo_config(opts);
+    if config.is_empty() {
         let _ = fs::remove_file(cargo_dir.join("config.toml"));
+    } else {
+        fs::create_dir_all(&cargo_dir)?;
+        fs::write(cargo_dir.join("config.toml"), config)?;
     }
     // A stale lock file from an older toolchain is harmless but confusing.
     let _ = fs::remove_file(dir.join("Cargo.lock"));

@@ -402,9 +402,8 @@ impl Tokenizer {
                 Some(id) => out.push(id),
                 None => {
                     for &b in piece {
-                        match self.byte_token(b).or_else(|| self.unk()) {
-                            Some(id) => out.push(id),
-                            None => {}
+                        if let Some(id) = self.byte_token(b).or_else(|| self.unk()) {
+                            out.push(id);
                         }
                     }
                 }
@@ -514,9 +513,8 @@ impl Tokenizer {
                 for &b in piece {
                     let mut buf = [0u8; 4];
                     let c = byte_to_char(b).encode_utf8(&mut buf);
-                    match self.find(c.as_bytes()).or_else(|| self.unk()) {
-                        Some(id) => out.push(id),
-                        None => {}
+                    if let Some(id) = self.find(c.as_bytes()).or_else(|| self.unk()) {
+                        out.push(id);
                     }
                 }
             }

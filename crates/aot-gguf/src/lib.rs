@@ -446,12 +446,12 @@ pub mod writer {
                 offset += data.len() as u64;
                 offset = offset.div_ceil(self.alignment) * self.alignment;
             }
-            while out.len() as u64 % self.alignment != 0 {
+            while !(out.len() as u64).is_multiple_of(self.alignment) {
                 out.push(0);
             }
             for (_, _, _, data) in &self.tensors {
                 out.extend_from_slice(data);
-                while out.len() as u64 % self.alignment != 0 {
+                while !(out.len() as u64).is_multiple_of(self.alignment) {
                     out.push(0);
                 }
             }

@@ -311,7 +311,7 @@ pub fn dequant_row_bf16(row: &[u8], out: &mut [f32]) {
 }
 
 pub fn dequant_row_q4_0(row: &[u8], out: &mut [f32]) {
-    for (i, chunk) in out.chunks_exact_mut(QK8_0).enumerate() {
+    for (i, chunk) in out.as_chunks_mut::<QK8_0>().0.iter_mut().enumerate() {
         let b = &row[i * Q4_0_SIZE..(i + 1) * Q4_0_SIZE];
         let d = read_f16(b, 0);
         for j in 0..16 {
@@ -323,7 +323,7 @@ pub fn dequant_row_q4_0(row: &[u8], out: &mut [f32]) {
 }
 
 pub fn dequant_row_q8_0(row: &[u8], out: &mut [f32]) {
-    for (i, chunk) in out.chunks_exact_mut(QK8_0).enumerate() {
+    for (i, chunk) in out.as_chunks_mut::<QK8_0>().0.iter_mut().enumerate() {
         let b = &row[i * Q8_0_SIZE..(i + 1) * Q8_0_SIZE];
         let d = read_f16(b, 0);
         for j in 0..QK8_0 {
@@ -333,7 +333,7 @@ pub fn dequant_row_q8_0(row: &[u8], out: &mut [f32]) {
 }
 
 pub fn dequant_row_q4_k(row: &[u8], out: &mut [f32]) {
-    for (i, chunk) in out.chunks_exact_mut(QK_K).enumerate() {
+    for (i, chunk) in out.as_chunks_mut::<QK_K>().0.iter_mut().enumerate() {
         let b = &row[i * Q4_K_SIZE..(i + 1) * Q4_K_SIZE];
         let d = read_f16(b, 0);
         let dmin = read_f16(b, 2);
@@ -356,7 +356,7 @@ pub fn dequant_row_q4_k(row: &[u8], out: &mut [f32]) {
 }
 
 pub fn dequant_row_q5_k(row: &[u8], out: &mut [f32]) {
-    for (i, chunk) in out.chunks_exact_mut(QK_K).enumerate() {
+    for (i, chunk) in out.as_chunks_mut::<QK_K>().0.iter_mut().enumerate() {
         let b = &row[i * Q5_K_SIZE..(i + 1) * Q5_K_SIZE];
         let d = read_f16(b, 0);
         let dmin = read_f16(b, 2);
@@ -384,7 +384,7 @@ pub fn dequant_row_q5_k(row: &[u8], out: &mut [f32]) {
 }
 
 pub fn dequant_row_q6_k(row: &[u8], out: &mut [f32]) {
-    for (i, chunk) in out.chunks_exact_mut(QK_K).enumerate() {
+    for (i, chunk) in out.as_chunks_mut::<QK_K>().0.iter_mut().enumerate() {
         let b = &row[i * Q6_K_SIZE..(i + 1) * Q6_K_SIZE];
         let d = read_f16(b, 208);
         for n in 0..2 {
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn f16_roundtrip() {
-        for &v in &[0.0f32, 1.0, -1.0, 0.5, 65504.0, 1e-5, 6.1e-5, 3.14159, -0.333, 1e-7] {
+        for &v in &[0.0f32, 1.0, -1.0, 0.5, 65504.0, 1e-5, 6.1e-5, 1.2345, -0.333, 1e-7] {
             let h = f32_to_f16(v);
             let back = f16_to_f32(h);
             assert!((back - v).abs() <= v.abs() * 1e-3 + 1e-7, "{v} -> {h:#x} -> {back}");

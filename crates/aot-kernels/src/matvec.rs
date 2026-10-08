@@ -250,9 +250,15 @@ pub fn kernels_by_name(name: &str) -> Option<Kernels> {
     }
 }
 
+/// The kernel set in use (an override if one was set, else the detected one).
+#[inline]
+pub fn active_kernels() -> &'static Kernels {
+    OVERRIDE.get().unwrap_or_else(kernels)
+}
+
 #[inline]
 fn active() -> &'static Kernels {
-    OVERRIDE.get().unwrap_or_else(kernels)
+    active_kernels()
 }
 
 /// Parallel loop over the rows of a quantized matrix.
@@ -322,6 +328,7 @@ pub fn matvec_f32(pool: &Pool, out: &mut [f32], w: &[u8], x: &[f32], rows: usize
 /// Two matrix-vector products that share the same input, issued as one
 /// parallel region (used for the gate/up projections of the feed-forward
 /// block). Both matrices must have the same kind and shape.
+#[allow(clippy::too_many_arguments)]
 pub fn matvec2_q8_k_input(
     pool: &Pool,
     out_a: &mut [f32],
@@ -349,6 +356,7 @@ pub fn matvec2_q8_k_input(
 }
 
 /// Same as [`matvec2_q8_k_input`] for Q8_0-quantized inputs.
+#[allow(clippy::too_many_arguments)]
 pub fn matvec2_q8_0_input(
     pool: &Pool,
     out_a: &mut [f32],

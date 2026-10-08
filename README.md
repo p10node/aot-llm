@@ -118,12 +118,12 @@ Per matmul, the f32 activation vector is quantized once to Q8_0 (for Q4_0/Q8_0 w
 
 ### Repository layout
 
-| crate | role |
-|---|---|
-| `crates/aot-gguf` | GGUF v2/v3 parser (header, metadata, tensor descriptors), memory-mapped access, in-memory writer for tests |
+| crate                | role                                                                                                                                                                                |
+|----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `crates/aot-gguf`    | GGUF v2/v3 parser (header, metadata, tensor descriptors), memory-mapped access, in-memory writer for tests                                                                          |
 | `crates/aot-kernels` | the runtime: quant layouts, SIMD matvec kernels, RMSNorm / RoPE / attention, thread pool, tokenizer, sampler, CLI driver. Copied verbatim into every generated project as `src/rt/` |
-| `crates/aot-codegen` | graph extraction (`ModelSpec`), tokenizer blob builder, Rust project emitter, cargo driver |
-| `crates/aot-llm` | the `aot-llm` CLI: `compile`, `inspect`, `tokenize` |
+| `crates/aot-codegen` | graph extraction (`ModelSpec`), tokenizer blob builder, Rust project emitter, cargo driver                                                                                          |
+| `crates/aot-llm`     | the `aot-llm` CLI: `compile`, `inspect`, `tokenize`                                                                                                                                 |
 
 ## Benchmarks
 
@@ -131,37 +131,37 @@ Machine: Apple M1 Pro (8 performance + 2 efficiency cores, 16 GB), macOS, Rust 1
 
 ### Startup latency
 
-| | TinyLlama-1.1B Q4_K_M | Llama-3.2-1B-Instruct Q4_K_M |
-|---|---|---|
-| **aot-llm** process start -> ready to decode | **0.19 ms** (threads 0.11, tokenize 0.08) | **0.27 ms** |
-| aot-llm time to first token (warm cache) | 120 ms (prompt eval) | 110 ms |
-| Ollama cold request, CPU (model load / total) | 1.57 s / 2.33 s | 2.84 s / 4.61 s |
-| Ollama cold request, Metal GPU (model load / total) | 0.54 s / 1.34 s | 0.83 s / 1.48 s |
-| Ollama warm request overhead (model already resident) | ~0.58 s total for 64 tokens | ~0.78 s |
+|                                                       | TinyLlama-1.1B Q4_K_M                     | Llama-3.2-1B-Instruct Q4_K_M |
+|-------------------------------------------------------|-------------------------------------------|------------------------------|
+| **aot-llm** process start -> ready to decode          | **0.19 ms** (threads 0.11, tokenize 0.08) | **0.27 ms**                  |
+| aot-llm time to first token (warm cache)              | 120 ms (prompt eval)                      | 110 ms                       |
+| Ollama cold request, CPU (model load / total)         | 1.57 s / 2.33 s                           | 2.84 s / 4.61 s              |
+| Ollama cold request, Metal GPU (model load / total)   | 0.54 s / 1.34 s                           | 0.83 s / 1.48 s              |
+| Ollama warm request overhead (model already resident) | ~0.58 s total for 64 tokens               | ~0.78 s                      |
 
 "Ready" for aot-llm means the weights are mapped, the tokenizer has encoded the prompt, the worker pool is up and the KV cache is allocated. Nothing is read from disk at startup; the first forward pass pages the weights in (about 0.6 s on a cold page cache for 640 MB, like any mmap-based loader).
 
 ### Memory
 
-| | TinyLlama-1.1B Q4_K_M | Llama-3.2-1B-Instruct Q4_K_M |
-|---|---|---|
-| **aot-llm** peak RSS (whole process, incl. KV cache) | **608 MiB** | **770 MiB** |
-| aot-llm binary on disk | 642 MiB | 776 MiB |
-| Ollama `llama-server` RSS, CPU mode | 798 MiB | 1586 MiB |
-| Ollama `llama-server` RSS, GPU mode | 766 MiB | 1420 MiB |
-| Ollama `ollama serve` + app processes | ~40 MiB | ~40 MiB |
+|                                                      | TinyLlama-1.1B Q4_K_M | Llama-3.2-1B-Instruct Q4_K_M |
+|------------------------------------------------------|-----------------------|------------------------------|
+| **aot-llm** peak RSS (whole process, incl. KV cache) | **608 MiB**           | **770 MiB**                  |
+| aot-llm binary on disk                               | 642 MiB               | 776 MiB                      |
+| Ollama `llama-server` RSS, CPU mode                  | 798 MiB               | 1586 MiB                     |
+| Ollama `llama-server` RSS, GPU mode                  | 766 MiB               | 1420 MiB                     |
+| Ollama `ollama serve` + app processes                | ~40 MiB               | ~40 MiB                      |
 
 aot-llm's RSS is essentially the touched weight pages (636 / 763 MiB of tensor data) plus a context-sized KV cache; there is no second copy of anything.
 
 ### Throughput (CPU, 8 threads unless noted)
 
-| | TinyLlama-1.1B Q4_K_M | TinyLlama-1.1B Q4_0 | Llama-3.2-1B Q4_K_M |
-|---|---|---|---|
-| **aot-llm** decode | **107 tok/s** | 85 tok/s | **86 tok/s** |
-| aot-llm prompt eval (token by token) | 107 tok/s | 90 tok/s | 100 tok/s |
-| Ollama / llama.cpp CPU decode | 117 tok/s | - | 86 tok/s |
-| Ollama / llama.cpp CPU prompt eval (batched) | 510 tok/s | - | 412 tok/s |
-| Ollama / llama.cpp Metal GPU decode | 150 tok/s | - | 139 tok/s |
+|                                              | TinyLlama-1.1B Q4_K_M | TinyLlama-1.1B Q4_0 | Llama-3.2-1B Q4_K_M |
+|----------------------------------------------|-----------------------|---------------------|---------------------|
+| **aot-llm** decode                           | **107 tok/s**         | 85 tok/s            | **86 tok/s**        |
+| aot-llm prompt eval (token by token)         | 107 tok/s             | 90 tok/s            | 100 tok/s           |
+| Ollama / llama.cpp CPU decode                | 117 tok/s             | -                   | 86 tok/s            |
+| Ollama / llama.cpp CPU prompt eval (batched) | 510 tok/s             | -                   | 412 tok/s           |
+| Ollama / llama.cpp Metal GPU decode          | 150 tok/s             | -                   | 139 tok/s           |
 
 Decode speed is within ~10% of llama.cpp's CPU path. Prompt evaluation is the known gap: aot-llm processes prompt tokens one at a time (matrix-vector), while llama.cpp batches them into matrix-matrix products. Using 10 threads on this machine (i.e. the two efficiency cores) drops throughput to ~20 tok/s because every parallel region waits for its slowest worker, hence the default cap of 8.
 

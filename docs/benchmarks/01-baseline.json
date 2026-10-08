@@ -1,0 +1,119 @@
+{
+  "label": "baseline",
+  "date": "2026-10-09",
+  "git": {
+    "commit": "bf6f95b",
+    "subject": "README with architecture diagram and benchmarks; license files",
+    "dirty": true
+  },
+  "machine": {
+    "platform": "darwin",
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cpu": "Apple M1 Pro",
+    "cores": "10",
+    "ram_gib": 16,
+    "os": "macOS 27.0.1",
+    "load_avg": [
+      5.73,
+      5.19,
+      5.28
+    ]
+  },
+  "runs": 5,
+  "notes": "Baseline: token-by-token prompt eval, no prefetch, static row split. Machine was running the user's desktop apps (see load average), so decode figures carry \u00b115% noise.",
+  "binaries": [
+    {
+      "name": "tinyllama_q4km",
+      "path": "/Users/pierreneter/WD/workplace--pierreneter/oss/aot-llm/out/tinyllama_bin",
+      "binary_mib": 642.3,
+      "threads": 8,
+      "kernels": "neon+dotprod",
+      "cold": {
+        "startup_ms": 1.307,
+        "first_token_ms": 651.9,
+        "prompt_tokens": 13,
+        "prompt_tps": 19.9,
+        "gen_tps": 79.6,
+        "peak_rss_mib": 608
+      },
+      "warm": {
+        "startup_ms": 0.199,
+        "first_token_ms": 135.1,
+        "prompt_tokens": 13,
+        "prompt_tps": 96.3,
+        "gen_tps": 103.5,
+        "gen_tps_min": 51.6,
+        "gen_tps_max": 107.3,
+        "peak_rss_mib": 608
+      },
+      "chat": {
+        "prompt_tokens": 88,
+        "first_token_ms": 684.6,
+        "prompt_tps": 128.6
+      },
+      "sample_output": "it is a funny story.\n\n2. The Tale of the Three Little Pigs:\n\nThe Tale of the Three Little Pigs is a classic fairy tale t"
+    },
+    {
+      "name": "tinyllama_q40",
+      "path": "/Users/pierreneter/WD/workplace--pierreneter/oss/aot-llm/out/tinyllama_q40",
+      "binary_mib": 612.4,
+      "threads": 8,
+      "kernels": "neon+dotprod",
+      "cold": {
+        "startup_ms": 0.743,
+        "first_token_ms": 655.8,
+        "prompt_tokens": 13,
+        "prompt_tps": 19.8,
+        "gen_tps": 71.9,
+        "peak_rss_mib": 578
+      },
+      "warm": {
+        "startup_ms": 0.22,
+        "first_token_ms": 124.7,
+        "prompt_tokens": 13,
+        "prompt_tps": 104.3,
+        "gen_tps": 73.7,
+        "gen_tps_min": 33.0,
+        "gen_tps_max": 98.7,
+        "peak_rss_mib": 578
+      },
+      "chat": {
+        "prompt_tokens": 88,
+        "first_token_ms": 1070.8,
+        "prompt_tps": 82.2
+      },
+      "sample_output": "it's a funny poem.\n\n2. \"The Grapes of Wrath\" by John Steinbeck: This classic novel is a powerful and poignant exploratio"
+    },
+    {
+      "name": "llama32_1b_q4km",
+      "path": "/Users/pierreneter/WD/workplace--pierreneter/oss/aot-llm/out/llama32_1b",
+      "binary_mib": 776.3,
+      "threads": 8,
+      "kernels": "neon+dotprod",
+      "cold": {
+        "startup_ms": 1.502,
+        "first_token_ms": 1029.6,
+        "prompt_tokens": 11,
+        "prompt_tps": 10.7,
+        "gen_tps": 22.0,
+        "peak_rss_mib": 771
+      },
+      "warm": {
+        "startup_ms": 0.295,
+        "first_token_ms": 120.8,
+        "prompt_tokens": 11,
+        "prompt_tps": 91.2,
+        "gen_tps": 60.7,
+        "gen_tps_min": 47.7,
+        "gen_tps_max": 66.6,
+        "peak_rss_mib": 772
+      },
+      "chat": {
+        "prompt_tokens": 70,
+        "first_token_ms": 776.9,
+        "prompt_tps": 90.1
+      },
+      "sample_output": "the fox is faster than the dog. This is a classic example of a lateral thinking puzzle, which requires the solver to thi"
+    }
+  ]
+}

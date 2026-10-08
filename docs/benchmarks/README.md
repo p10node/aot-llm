@@ -12,6 +12,12 @@ Throughput columns show the median of the warm runs and, in parentheses, the bes
 | 2 | [batched-prompt](02-batched-prompt.md) | `8c36d40` | tinyllama_q4km | 0.231 | 584 | 91 | 567 (-) | 155.3 (-) | 112.4 (114.6) | 609 | 7.21 |
 | 2 | [batched-prompt](02-batched-prompt.md) | `8c36d40` | tinyllama_q40 | 0.235 | 545 | 114 | 752 (-) | 117.1 (-) | 111.6 (112.3) | 580 | 7.21 |
 | 2 | [batched-prompt](02-batched-prompt.md) | `8c36d40` | llama32_1b_q4km | 0.324 | 719 | 114 | 583 (-) | 120.1 (-) | 61.2 (81.8) | 773 | 7.21 |
-| 3 | [batched-x4](03-batched-x4.md) | `703bdf4` | tinyllama_q4km | 0.223 | 636 | 127 | 568 (430) | 154.9 (204.5) | 51.4 (73.7) | 609 | 3.53 |
-| 3 | [batched-x4](03-batched-x4.md) | `703bdf4` | tinyllama_q40 | 0.233 | 597 | 77 | 473 (398) | 186.0 (221.0) | 66.9 (110.0) | 580 | 3.53 |
-| 3 | [batched-x4](03-batched-x4.md) | `703bdf4` | llama32_1b_q4km | 0.301 | 756 | 117 | 379 (361) | 185.0 (194.2) | 51.8 (58.2) | 773 | 3.53 |
+| 3 | [batched-x4](03-batched-x4.md) | `89784d4` | tinyllama_q4km | 0.232 | 590 | 65 | 424 (351) | 207.4 (250.6) | 115.7 (116.5) | 609 | 2.9 |
+| 3 | [batched-x4](03-batched-x4.md) | `89784d4` | tinyllama_q40 | 0.225 | 546 | 91 | 571 (469) | 154.0 (187.7) | 76.9 (112.5) | 580 | 2.9 |
+| 3 | [batched-x4](03-batched-x4.md) | `89784d4` | llama32_1b_q4km | 0.290 | 711 | 66 | 488 (283) | 143.4 (247.8) | 82.8 (93.8) | 773 | 2.9 |
+| 4 | [prefault](04-prefault.md) | `89784d4` | tinyllama_q4km | 0.473 | 642 | 67 | 375 (362) | 234.9 (243.0) | 114.4 (115.8) | 644 | 6.15 |
+| 4 | [prefault](04-prefault.md) | `89784d4` | tinyllama_q40 | 0.455 | 593 | 71 | 485 (373) | 181.4 (235.8) | 95.7 (113.6) | 614 | 6.15 |
+| 4 | [prefault](04-prefault.md) | `89784d4` | llama32_1b_q4km | 0.738 | 711 | 70 | 302 (286) | 231.5 (244.8) | 93.0 (93.8) | 773 | 6.15 |
+| 5 | [decode-tuning](05-decode-tuning.md) | `89784d4` | tinyllama_q4km | 0.440 | 606 | 68 | 436 (355) | 201.7 (247.8) | 127.7 (131.1) | 644 | 7.61 |
+| 5 | [decode-tuning](05-decode-tuning.md) | `89784d4` | tinyllama_q40 | 0.418 | 580 | 60 | 341 (296) | 257.9 (296.9) | 120.7 (142.7) | 614 | 7.61 |
+| 5 | [decode-tuning](05-decode-tuning.md) | `89784d4` | llama32_1b_q4km | 2.003 | 704 | 64 | 298 (280) | 235.1 (250.2) | 113.2 (113.3) | 773 | 7.61 |

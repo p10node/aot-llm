@@ -26,6 +26,9 @@ The output is byte-for-byte identical to llama.cpp (via Ollama) for the same GGU
 * **Zero-copy weights.** The tensor data section of the GGUF file is copied verbatim into a private read-only section of the executable with the assembler's `.incbin` directive. The loader `mmap`s it like any other segment, so starting the binary costs no I/O; pages are faulted in on first touch. A `--sidecar` mode keeps the weights in a separate file that the binary `mmap`s at startup.
 * **Static code generation.** The compiler reads the model graph from GGUF metadata and emits `model.rs`: a tensor table with byte offsets, and a `forward()` whose per-layer code is unrolled with the kernel for each tensor's quantization type chosen at compile time (`matvec_q4_k`, `matvec_q6_k`, ...). There is no graph interpreter.
 * **SIMD kernels** for Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, F16, BF16 and F32 weights: NEON (with `sdot` when available) on ARM64, AVX2 + FMA (+ F16C) on x86_64, scalar fallback. The implementation is picked once at startup, so a binary runs on any CPU of its architecture.
+* **Batched prompt processing.** Prompt tokens go through the model in chunks of up to 64 (`--batch`); each weight row is read once per chunk and multiplied against four activations at a time by 1x4 micro-kernels, so prompt evaluation is compute-bound rather than memory-bound. Results are bit-identical to token-by-token evaluation.
+* **Compile-time KV prefix cache.** `aot-llm compile --system "..."` evaluates the system prompt at build time and embeds its key/value cache in the binary; a chat prompt with that system prompt skips straight to the user turn.
+* **Background prefault.** At startup worker threads page the weights in (`madvise` + page touch) while the main thread tokenizes, which shortens cold first-token latency. `--no-prefetch` turns it off.
 * **Single-binary output.** `aot-llm compile` writes a standalone Cargo project and builds it; cross-compiling to `x86_64-unknown-linux-musl` from macOS produces a static ELF.
 
 ## Quick start
@@ -42,9 +45,14 @@ cargo build --release
 # Compile (about 10-15 s on an M1 Pro; the GGUF is embedded, not copied)
 ./target/release/aot-llm compile --model ./Llama-3.2-1B-Instruct-Q4_K_M.gguf --output ./llama32
 
+# Optional: bake the KV cache of a fixed system prompt into the binary (two build passes)
+./target/release/aot-llm compile --model ./Llama-3.2-1B-Instruct-Q4_K_M.gguf --output ./llama32 \
+    --system "You are a concise assistant. Answer in one short paragraph."
+
 # Run
 ./llama32 --prompt "The capital of France is" -n 32
 ./llama32 --chat --prompt "Write one sentence about the moon." --temp 0.7
+./llama32 --chat --system "You are a concise assistant. Answer in one short paragraph." --prompt "Why is the sky blue?"   # uses the baked prefix
 ./llama32 --info
 ```
 
@@ -60,10 +68,12 @@ Generated binary options:
     --seed N             RNG seed [default: 42]
 -c, --ctx N              Context length [default: prompt + max-tokens]
 -t, --threads N          Worker threads [default: min(cores, 8)]
+-b, --batch N            Prompt tokens per batched step, 1 = token by token [default: 64]
     --chat               Wrap the prompt in the model's chat template (llama3 / zephyr / chatml / llama2 / mistral / gemma)
     --system TEXT        System prompt for --chat
     --no-bos             Do not prepend the BOS token
-    --prefetch           Advise the OS to page in all weights up front
+    --no-prefetch        Do not page in the weights from background threads at startup
+    --no-prefix-cache    Ignore the compile-time KV prefix cache
     --kernels NAME       auto | scalar | neon | neon-dotprod | avx2
     --weights PATH       Sidecar weights file (sidecar builds only)
     --show-special       Print special tokens
@@ -73,7 +83,9 @@ Generated binary options:
     --info               Print model information and exit
 ```
 
-Compiler options (`aot-llm compile --help`): `--target <triple>`, `--native` (`-C target-cpu=native`), `--sidecar`, `--emit-only` (generate the project without building), `--build-dir`, `--name`, `-j`, `-q`.
+Compiler options (`aot-llm compile --help`): `--system TEXT` / `--prefix TEXT` (bake a KV prefix cache), `--target <triple>`, `--native` (`-C target-cpu=native`), `--sidecar`, `--emit-only` (generate the project without building), `--build-dir`, `--name`, `-j`, `-q`.
+
+Debugging: `AOT_DEBUG_COMPARE=1 ./bin ...` re-evaluates the prompt token by token and reports the first KV-cache divergence from the batched path; `--dump-logits` prints the logits of the last prompt token.
 
 ## How it works
 
@@ -114,7 +126,9 @@ The static pipeline emitted for every model is
 tokens -> embedding -> [RMSNorm -> Attention(GQA, RoPE, KV cache) -> + -> RMSNorm -> SwiGLU FFN -> +] x N -> RMSNorm -> logits -> sampler
 ```
 
-Per matmul, the f32 activation vector is quantized once to Q8_0 (for Q4_0/Q8_0 weights) or Q8_K (for K-quants) and every output row is an integer dot product scaled back to f32, the same scheme ggml uses, so results match llama.cpp. The gate and up projections share one parallel region; attention is parallel over heads. The thread pool keeps workers hot between the few hundred small parallel regions of a decode step.
+Per matmul, the f32 activation vector is quantized once to Q8_0 (for Q4_0/Q8_0 weights) or Q8_K (for K-quants) and every output row is an integer dot product scaled back to f32, the same scheme ggml uses, so results match llama.cpp. During decoding the q/k/v projections form one parallel region and gate/up another; rows are handed out in dynamic chunks; attention is parallel over heads. The thread pool keeps workers hot between the few hundred small parallel regions of a decode step.
+
+Prompt tokens are processed by `forward_batch` in chunks: every weight row is loaded once per chunk and the 1x4 micro-kernels decode each quantized block once for four activations, so prompt evaluation runs several times faster than decoding. With `--system`, the compiler builds the binary twice: pass 1 evaluates the system prefix with the final kernels and writes its KV cache, pass 2 embeds that blob in a read-only section; at run time a prompt whose tokens start with the baked prefix loads the rows with a memcpy and evaluates only the user turn.
 
 ### Repository layout
 
@@ -126,6 +140,8 @@ Per matmul, the f32 activation vector is quantized once to Q8_0 (for Q4_0/Q8_0 w
 | `crates/aot-llm`     | the `aot-llm` CLI: `compile`, `inspect`, `tokenize`                                                                                                                                 |
 
 ## Benchmarks
+
+The tables below are the initial measurements of the first release. Every later optimisation step is measured with `scripts/bench.py` and recorded under [`docs/benchmarks/`](docs/benchmarks/README.md) (one file per step, cold/warm/chat columns, plus the Ollama reference).
 
 Machine: Apple M1 Pro (8 performance + 2 efficiency cores, 16 GB), macOS, Rust 1.99. Prompt: 11-13 tokens, 64 generated tokens, greedy, warm page cache, 8 threads, median of 3 runs on an otherwise idle machine. Ollama 0.34.4 with its bundled llama.cpp `llama-server`, same GGUF files imported with `ollama create`, measured through `/api/generate` (`raw: true`); "cold" means after `ollama stop`.
 

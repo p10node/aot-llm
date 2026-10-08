@@ -1,0 +1,13 @@
+[package]
+name = "aot-codegen"
+description = "Turns a parsed GGUF model into a standalone Rust project with a static forward pass"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aot-gguf = { path = "../aot-gguf" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

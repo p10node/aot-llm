@@ -1,0 +1,12 @@
+[package]
+name = "aot-kernels"
+description = "Dependency-free runtime kernels (SIMD quantized matmul, norms, RoPE, attention, tokenizer, sampler). These sources are copied verbatim into every generated binary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[dev-dependencies]

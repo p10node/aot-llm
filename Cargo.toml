@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aot-gguf",
+    "crates/aot-kernels",
+    "crates/aot-codegen",
+    "crates/aot-llm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pierreneter/aot-llm"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

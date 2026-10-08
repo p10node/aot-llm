@@ -1,0 +1,5 @@
+/target
+**/*.build/
+*.gguf
+*.bin
+.DS_Store

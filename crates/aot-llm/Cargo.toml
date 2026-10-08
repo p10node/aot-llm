@@ -1,0 +1,19 @@
+[package]
+name = "aot-llm"
+description = "Ahead-of-time compiler: GGUF model -> single zero-dependency native executable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "aot-llm"
+path = "src/main.rs"
+
+[dependencies]
+aot-gguf = { path = "../aot-gguf" }
+aot-codegen = { path = "../aot-codegen" }
+aot-kernels = { path = "../aot-kernels" }
+anyhow = { workspace = true }
+clap = { workspace = true }

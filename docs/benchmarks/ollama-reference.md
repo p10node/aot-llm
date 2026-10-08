@@ -8,29 +8,29 @@ after `ollama stop <model>`; "warm" = model already resident. CPU mode = `num_gp
 
 ## Latency
 
-| model | mode | cold: model load | cold: total request (64 tok) | warm: total request (64 tok) |
-|---|---|---|---|---|
-| TinyLlama-1.1B-Chat Q4_K_M | CPU, 8 threads | 1.57 s | 2.33 s | 0.58 s |
-| TinyLlama-1.1B-Chat Q4_K_M | Metal GPU | 0.54 s | 1.34 s | 0.47 s |
-| Llama-3.2-1B-Instruct Q4_K_M | CPU, 8 threads | 2.84 s | 4.61 s | 0.78 s |
-| Llama-3.2-1B-Instruct Q4_K_M | Metal GPU | 0.83 s | 1.48 s | 0.50 s |
+| model                        | mode           | cold: model load | cold: total request (64 tok) | warm: total request (64 tok) |
+|------------------------------|----------------|------------------|------------------------------|------------------------------|
+| TinyLlama-1.1B-Chat Q4_K_M   | CPU, 8 threads | 1.57 s           | 2.33 s                       | 0.58 s                       |
+| TinyLlama-1.1B-Chat Q4_K_M   | Metal GPU      | 0.54 s           | 1.34 s                       | 0.47 s                       |
+| Llama-3.2-1B-Instruct Q4_K_M | CPU, 8 threads | 2.84 s           | 4.61 s                       | 0.78 s                       |
+| Llama-3.2-1B-Instruct Q4_K_M | Metal GPU      | 0.83 s           | 1.48 s                       | 0.50 s                       |
 
 The server process itself (`ollama serve`) was already running; these numbers do not include starting it.
 
 ## Throughput (warm)
 
-| model | mode | prompt eval tok/s | decode tok/s |
-|---|---|---|---|
-| TinyLlama-1.1B-Chat Q4_K_M | CPU, 8 threads | 510 | 117 |
-| TinyLlama-1.1B-Chat Q4_K_M | Metal GPU | 340 | 150 |
-| Llama-3.2-1B-Instruct Q4_K_M | CPU, 8 threads | 412 | 86 |
-| Llama-3.2-1B-Instruct Q4_K_M | Metal GPU | 388 | 139 |
+| model                        | mode           | prompt eval tok/s | decode tok/s |
+|------------------------------|----------------|-------------------|--------------|
+| TinyLlama-1.1B-Chat Q4_K_M   | CPU, 8 threads | 510               | 117          |
+| TinyLlama-1.1B-Chat Q4_K_M   | Metal GPU      | 340               | 150          |
+| Llama-3.2-1B-Instruct Q4_K_M | CPU, 8 threads | 412               | 86           |
+| Llama-3.2-1B-Instruct Q4_K_M | Metal GPU      | 388               | 139          |
 
 ## Memory (RSS of `llama-server` while the model is resident)
 
-| model | CPU mode | GPU mode |
-|---|---|---|
-| TinyLlama-1.1B-Chat Q4_K_M | 798 MiB | 766 MiB |
+| model                        | CPU mode | GPU mode |
+|------------------------------|----------|----------|
+| TinyLlama-1.1B-Chat Q4_K_M   | 798 MiB  | 766 MiB  |
 | Llama-3.2-1B-Instruct Q4_K_M | 1586 MiB | 1420 MiB |
 
 Plus `ollama serve` (22–27 MiB) and the menu-bar app (12–20 MiB).

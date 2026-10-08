@@ -8,27 +8,27 @@
 
 ## Startup and time to first token
 
-| binary | startup (ms) | cold first token (ms) | warm first token (ms) | chat first token (ms) | chat prompt tokens |
-|---|---|---|---|---|---|
-| tinyllama_q4km | 0.199 | 652 | 135 | 685 | 88 |
-| tinyllama_q40 | 0.220 | 656 | 125 | 1071 | 88 |
-| llama32_1b_q4km | 0.295 | 1030 | 121 | 777 | 70 |
+| binary          | startup (ms) | cold first token (ms) | warm first token (ms) | chat first token (ms) | chat prompt tokens |
+|-----------------|--------------|-----------------------|-----------------------|-----------------------|--------------------|
+| tinyllama_q4km  | 0.199        | 652                   | 135                   | 685                   | 88                 |
+| tinyllama_q40   | 0.220        | 656                   | 125                   | 1071                  | 88                 |
+| llama32_1b_q4km | 0.295        | 1030                  | 121                   | 777                   | 70                 |
 
 ## Throughput and memory
 
-| binary | prompt tok/s (warm) | chat prompt tok/s | decode tok/s (median) | decode min–max | peak RSS (MiB) | binary (MiB) | kernels / threads |
-|---|---|---|---|---|---|---|---|
-| tinyllama_q4km | 96.3 | 128.6 | 103.5 | 51.6–107.3 | 608 | 642.3 | neon+dotprod / 8 |
-| tinyllama_q40 | 104.3 | 82.2 | 73.7 | 33.0–98.7 | 578 | 612.4 | neon+dotprod / 8 |
-| llama32_1b_q4km | 91.2 | 90.1 | 60.7 | 47.7–66.6 | 772 | 776.3 | neon+dotprod / 8 |
+| binary          | prompt tok/s (warm) | chat prompt tok/s | decode tok/s (median) | decode min–max | peak RSS (MiB) | binary (MiB) | kernels / threads |
+|-----------------|---------------------|-------------------|-----------------------|----------------|----------------|--------------|-------------------|
+| tinyllama_q4km  | 96.3                | 128.6             | 103.5                 | 51.6–107.3     | 608            | 642.3        | neon+dotprod / 8  |
+| tinyllama_q40   | 104.3               | 82.2              | 73.7                  | 33.0–98.7      | 578            | 612.4        | neon+dotprod / 8  |
+| llama32_1b_q4km | 91.2                | 90.1              | 60.7                  | 47.7–66.6      | 772            | 776.3        | neon+dotprod / 8  |
 
 ## Cold run detail
 
-| binary | cold startup (ms) | cold prompt tok/s | cold decode tok/s |
-|---|---|---|---|
-| tinyllama_q4km | 1.307 | 19.9 | 79.6 |
-| tinyllama_q40 | 0.743 | 19.8 | 71.9 |
-| llama32_1b_q4km | 1.502 | 10.7 | 22.0 |
+| binary          | cold startup (ms) | cold prompt tok/s | cold decode tok/s |
+|-----------------|-------------------|-------------------|-------------------|
+| tinyllama_q4km  | 1.307             | 19.9              | 79.6              |
+| tinyllama_q40   | 0.743             | 19.8              | 71.9              |
+| llama32_1b_q4km | 1.502             | 10.7              | 22.0              |
 
 ## Notes
 

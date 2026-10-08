@@ -9,6 +9,7 @@ pub mod chat;
 pub mod matvec;
 pub mod ops;
 pub mod pool;
+pub mod prefix;
 pub mod quant;
 pub mod quantize;
 pub mod sampler;

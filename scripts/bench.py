@@ -32,11 +32,9 @@ import sys
 import tempfile
 
 PROMPT = "The quick brown fox jumps over the lazy dog because"
-CHAT_SYSTEM = (
-    "You are a concise assistant for a command line tool. Answer in one short "
-    "paragraph, avoid lists, do not repeat the question, and if you are unsure "
-    "say so. The user may write in English or Vietnamese; reply in the same language."
-)
+# Shared with `aot-llm compile --system "$(cat scripts/chat_system.txt)"` so the
+# baked KV prefix matches the benchmark's chat prompt exactly.
+CHAT_SYSTEM = (pathlib.Path(__file__).with_name("chat_system.txt").read_text().strip())
 CHAT_PROMPT = "What does a compiler do?"
 
 STATS = {

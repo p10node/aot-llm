@@ -12,3 +12,6 @@ Throughput columns show the median of the warm runs and, in parentheses, the bes
 | 2 | [batched-prompt](02-batched-prompt.md) | `8c36d40` | tinyllama_q4km | 0.231 | 584 | 91 | 567 (-) | 155.3 (-) | 112.4 (114.6) | 609 | 7.21 |
 | 2 | [batched-prompt](02-batched-prompt.md) | `8c36d40` | tinyllama_q40 | 0.235 | 545 | 114 | 752 (-) | 117.1 (-) | 111.6 (112.3) | 580 | 7.21 |
 | 2 | [batched-prompt](02-batched-prompt.md) | `8c36d40` | llama32_1b_q4km | 0.324 | 719 | 114 | 583 (-) | 120.1 (-) | 61.2 (81.8) | 773 | 7.21 |
+| 3 | [batched-x4](03-batched-x4.md) | `703bdf4` | tinyllama_q4km | 0.223 | 636 | 127 | 568 (430) | 154.9 (204.5) | 51.4 (73.7) | 609 | 3.53 |
+| 3 | [batched-x4](03-batched-x4.md) | `703bdf4` | tinyllama_q40 | 0.233 | 597 | 77 | 473 (398) | 186.0 (221.0) | 66.9 (110.0) | 580 | 3.53 |
+| 3 | [batched-x4](03-batched-x4.md) | `703bdf4` | llama32_1b_q4km | 0.301 | 756 | 117 | 379 (361) | 185.0 (194.2) | 51.8 (58.2) | 773 | 3.53 |

@@ -53,6 +53,14 @@ enum Cmd {
         /// Crate / binary name inside the generated project [default: from output name].
         #[arg(long)]
         name: Option<String>,
+        /// Bake the KV cache of this system prompt (chat template) into the
+        /// binary; `--chat --system <same text>` then skips re-evaluating it.
+        #[arg(long)]
+        system: Option<String>,
+        /// Bake the KV cache of this raw text prefix into the binary; prompts
+        /// that start with it (same tokenization) skip re-evaluating it.
+        #[arg(long, conflicts_with = "system")]
+        prefix: Option<String>,
     },
     /// Print metadata and tensors of a GGUF file.
     Inspect {
@@ -81,8 +89,8 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Compile { model, output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name } => {
-            compile(&model, &output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name)
+        Cmd::Compile { model, output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix } => {
+            compile(&model, &output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix)
         }
         Cmd::Inspect { model, tensors, metadata } => inspect(&model, tensors, metadata),
         Cmd::Tokenize { model, text, no_bos, chat } => tokenize(&model, &text, no_bos, chat),
@@ -116,6 +124,8 @@ fn compile(
     jobs: Option<usize>,
     quiet: bool,
     name: Option<String>,
+    system: Option<String>,
+    prefix: Option<String>,
 ) -> Result<()> {
     let t0 = Instant::now();
     let model = model.canonicalize().with_context(|| format!("model {} not found", model.display()))?;
@@ -156,7 +166,7 @@ fn compile(
         PathBuf::from(s)
     });
     let crate_name = name.unwrap_or_else(|| crate_name_from(&output.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
-    let opts = EmitOptions { crate_name: crate_name.clone(), sidecar, native, gguf_path: model.clone(), compiler_version: aot_codegen::VERSION.to_string(), target: target.clone() };
+    let mut opts = EmitOptions { crate_name: crate_name.clone(), sidecar, native, gguf_path: model.clone(), compiler_version: aot_codegen::VERSION.to_string(), target: target.clone(), prefix_kv_path: None };
     write_project(&dir, &spec, &blob, &opts).with_context(|| format!("writing project to {}", dir.display()))?;
     eprintln!("[3/4] generated project in {} (crate `{crate_name}`, {} layers unrolled, weights {})", dir.display(), d.n_layer, if sidecar { "sidecar" } else { "embedded" });
     if emit_only {
@@ -164,8 +174,45 @@ fn compile(
         return Ok(());
     }
 
-    eprintln!("[4/4] cargo build --release{}{} ...", target.as_ref().map(|t| format!(" --target {t}")).unwrap_or_default(), if native { " (target-cpu=native)" } else { "" });
-    let built = cargo_build(&dir, &crate_name, &BuildOptions { target, jobs, quiet, cargo: None })?;
+    let bake = system.is_some() || prefix.is_some();
+    eprintln!("[4/4] cargo build --release{}{}{} ...", target.as_ref().map(|t| format!(" --target {t}")).unwrap_or_default(), if native { " (target-cpu=native)" } else { "" }, if bake { " (pass 1 of 2)" } else { "" });
+    let mut built = cargo_build(&dir, &crate_name, &BuildOptions { target: target.clone(), jobs, quiet, cargo: None })?;
+
+    if bake {
+        // Pass 1 produced a binary without a prefix cache; use it to evaluate
+        // the prefix with the exact kernels of the final binary, then rebuild
+        // with the resulting KV blob embedded.
+        if target.is_some() {
+            bail!("--system/--prefix need to run the compiled binary, which is not possible with --target");
+        }
+        let kv_path = dir.canonicalize()?.join("prefix_kv.bin");
+        let mut cmd = std::process::Command::new(&built.binary);
+        cmd.arg("--bake-prefix-kv").arg(&kv_path);
+        match (&system, &prefix) {
+            (Some(s), _) => {
+                cmd.arg("--chat").arg("--system").arg(s);
+            }
+            (_, Some(p)) => {
+                cmd.arg("--prompt").arg(p);
+            }
+            _ => unreachable!(),
+        }
+        if sidecar {
+            let wp = g.data_section();
+            let tmp = dir.canonicalize()?.join("weights.tmp");
+            std::fs::write(&tmp, wp)?;
+            cmd.arg("--weights").arg(&tmp);
+        }
+        let status = cmd.status().context("running the pass-1 binary to bake the prefix")?;
+        if !status.success() {
+            bail!("baking the KV prefix failed ({status})");
+        }
+        let _ = std::fs::remove_file(dir.join("weights.tmp"));
+        opts.prefix_kv_path = Some(kv_path.clone());
+        write_project(&dir, &spec, &blob, &opts)?;
+        eprintln!("      cargo build --release (pass 2 of 2, embedding {}) ...", human(std::fs::metadata(&kv_path)?.len()));
+        built = cargo_build(&dir, &crate_name, &BuildOptions { target: target.clone(), jobs, quiet, cargo: None })?;
+    }
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;

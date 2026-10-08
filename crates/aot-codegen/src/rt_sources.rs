@@ -12,6 +12,7 @@ pub const RT_SOURCES: &[(&str, &str)] = &[
     ("simd_avx2.rs", include_str!("../../aot-kernels/src/simd_avx2.rs")),
     ("ops.rs", include_str!("../../aot-kernels/src/ops.rs")),
     ("pool.rs", include_str!("../../aot-kernels/src/pool.rs")),
+    ("prefix.rs", include_str!("../../aot-kernels/src/prefix.rs")),
     ("quant.rs", include_str!("../../aot-kernels/src/quant.rs")),
     ("quantize.rs", include_str!("../../aot-kernels/src/quantize.rs")),
     ("sampler.rs", include_str!("../../aot-kernels/src/sampler.rs")),

@@ -9,6 +9,7 @@
 use super::chat;
 use super::matvec;
 use super::pool::Pool;
+use super::prefix::Prefix;
 use super::sampler::{Sampler, SamplerConfig};
 use super::state::{Dims, ModelInfo, State, Tensor, Weights};
 use super::tokenizer::Tokenizer;
@@ -35,6 +36,8 @@ pub struct Runtime {
     /// Optional per-dimension RoPE frequency factors (Llama 3.x scaling).
     pub rope_freqs: Option<Tensor>,
     pub tokenizer_blob: &'static [u8],
+    /// Compile-time KV prefix cache (empty when none was baked).
+    pub prefix_kv: &'static [u8],
     /// Resolves the weights blob (embedded data or a sidecar file).
     pub weights: fn(Option<&Path>) -> std::io::Result<&'static [u8]>,
     /// `true` when weights live in a separate file next to the executable.
@@ -60,6 +63,8 @@ struct Args {
     show_special: bool,
     tokens_only: bool,
     dump_logits: bool,
+    no_prefix_cache: bool,
+    bake_prefix_kv: Option<PathBuf>,
 }
 
 const USAGE: &str = "\
@@ -85,6 +90,8 @@ Options:
       --show-special       Print special tokens
       --tokens             Print token ids instead of text
       --dump-logits        Print the logits of the last prompt token and exit
+      --no-prefix-cache    Ignore the compile-time KV prefix cache
+      --bake-prefix-kv P   (compiler use) evaluate the prompt and write its KV cache to P
   -q, --quiet              Do not print statistics to stderr
       --info               Print model information and exit
   -h, --help               Show this help
@@ -109,6 +116,8 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
         show_special: false,
         tokens_only: false,
         dump_logits: false,
+        no_prefix_cache: false,
+        bake_prefix_kv: None,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -138,6 +147,8 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
             "--show-special" => a.show_special = true,
             "--tokens" => a.tokens_only = true,
             "--dump-logits" => a.dump_logits = true,
+            "--no-prefix-cache" => a.no_prefix_cache = true,
+            "--bake-prefix-kv" => a.bake_prefix_kv = Some(PathBuf::from(next(&mut i, f)?)),
             "-q" | "--quiet" => a.quiet = true,
             "--info" => a.info = true,
             "-h" | "--help" => {
@@ -265,6 +276,7 @@ pub fn main(rt: Runtime) -> i32 {
     // Prompt.
     let raw = match &args.prompt {
         Some(p) => p.clone(),
+        None if args.bake_prefix_kv.is_some() && args.chat => String::new(),
         None => {
             let mut s = String::new();
             if std::io::stdin().read_to_string(&mut s).is_err() || s.trim().is_empty() {
@@ -275,10 +287,16 @@ pub fn main(rt: Runtime) -> i32 {
         }
     };
     let text = if args.chat {
-        match chat::format(tok.chat_format(), args.system.as_deref(), &raw) {
+        let built = if args.bake_prefix_kv.is_some() {
+            // Baking: only the part of the template that precedes the user turn.
+            chat::system_prefix(tok.chat_format(), args.system.as_deref()).filter(|s| !s.is_empty())
+        } else {
+            chat::format(tok.chat_format(), args.system.as_deref(), &raw)
+        };
+        match built {
             Some(t) => t,
             None => {
-                eprintln!("error: this model has no known chat template; use a raw prompt");
+                eprintln!("error: this model has no known chat template (or nothing to bake); use a raw prompt");
                 return 2;
             }
         }
@@ -305,15 +323,27 @@ pub fn main(rt: Runtime) -> i32 {
     let rope_ff = rt.rope_freqs.as_ref().map(|t| weights.f32s(t));
     let batch = args.batch.min(prompt.len()).max(1);
     let mut state = State::new(d, ctx, rope_ff, threads, batch);
+    // The baked prefix must fit in the context together with the prompt.
     let t_ready = t0.elapsed();
 
     if args.prefetch {
         weights::prefetch(&wbytes[..rt.info.weights_len]);
     }
 
+    // Compile-time KV prefix: skip the tokens whose cache is embedded.
+    let mut cached = 0usize;
+    if !args.no_prefix_cache && args.bake_prefix_kv.is_none() {
+        if let Some(pre) = Prefix::parse(rt.prefix_kv, d) {
+            if prompt.len() > pre.len() && prompt.starts_with(&pre.tokens) {
+                pre.load_into(&mut state);
+                cached = pre.len();
+            }
+        }
+    }
+
     // Prompt evaluation in batches (logits are only needed for the last token).
     let t1 = Instant::now();
-    let mut done = 0usize;
+    let mut done = cached;
     while done < prompt.len() {
         let end = (done + batch).min(prompt.len());
         let last = end == prompt.len();
@@ -325,6 +355,16 @@ pub fn main(rt: Runtime) -> i32 {
         done = end;
     }
     let t_prompt = t1.elapsed();
+
+    if let Some(path) = &args.bake_prefix_kv {
+        let blob = super::prefix::serialize(&state, d, &prompt);
+        if let Err(e) = std::fs::write(path, &blob) {
+            eprintln!("error: cannot write {}: {e}", path.display());
+            return 1;
+        }
+        eprintln!("[aot-llm] baked KV cache for {} prompt tokens ({:.1} MB) into {}", prompt.len(), mb(blob.len() as u64), path.display());
+        return 0;
+    }
 
     if std::env::var_os("AOT_DEBUG_COMPARE").is_some() && batch > 1 {
         // Debug aid: re-run the prompt token by token in a fresh state and
@@ -408,14 +448,16 @@ pub fn main(rt: Runtime) -> i32 {
         let ps = t_prompt.as_secs_f64();
         let gs = t_gen.as_secs_f64();
         let gen_forwards = generated.saturating_sub(1).max(if generated > 0 { 1 } else { 0 });
+        let evaluated = prompt.len() - cached;
         let mut line = format!(
-            "[aot-llm] startup {:.3} ms (threads {:.3}, tokenize {:.3}) | prompt {} tok / {:.3} s ({:.1} tok/s) | gen {} tok / {:.3} s ({:.1} tok/s)",
+            "[aot-llm] startup {:.3} ms (threads {:.3}, tokenize {:.3}) | prompt {} tok{} / {:.3} s ({:.1} tok/s) | gen {} tok / {:.3} s ({:.1} tok/s)",
             t_ready.as_secs_f64() * 1e3,
             t_pool.as_secs_f64() * 1e3,
             t_encode.as_secs_f64() * 1e3,
             prompt.len(),
+            if cached > 0 { format!(" ({cached} cached)") } else { String::new() },
             ps,
-            prompt.len() as f64 / ps.max(1e-9),
+            evaluated as f64 / ps.max(1e-9),
             generated,
             gs,
             gen_forwards as f64 / gs.max(1e-9),

@@ -11,10 +11,26 @@
 use super::super::quant::*;
 use std::arch::aarch64::*;
 
-#[inline]
+/// Load one half float and convert it with the `fcvt` instruction (base
+/// ARMv8 FP; no FEAT_FP16 needed). The software conversion costs ~10
+/// instructions and a branch per block, which dominated the Q4_0/Q8_0
+/// kernels where there is one scale per 32 elements.
+#[inline(always)]
 fn f16_at(p: *const u8) -> f32 {
-    // SAFETY: caller passes a pointer into a block with >= 2 readable bytes.
-    f16_to_f32(u16::from_le_bytes(unsafe { [*p, *p.add(1)] }))
+    let out: f32;
+    // SAFETY: caller passes a pointer into a block with >= 2 readable bytes;
+    // the asm only reads those two bytes.
+    unsafe {
+        std::arch::asm!(
+            "ldr {h:h}, [{p}]",
+            "fcvt {o:s}, {h:h}",
+            p = in(reg) p,
+            h = out(vreg) _,
+            o = out(vreg) out,
+            options(pure, readonly, nostack),
+        );
+    }
+    out
 }
 
 /// Signed 8-bit dot product without the `dotprod` extension.

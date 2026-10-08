@@ -182,9 +182,28 @@ fn emit_layer(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec) {
     // Attention.
     writeln!(out, "    rmsnorm(&mut s.xb, &s.x, w.f32s(&l.attn_norm), DIMS.eps);").unwrap();
     emit_quantize(out, "xb", [l.wq.kind, l.wk.kind, l.wv.kind].into_iter());
-    emit_matvec(out, &l.wq, "l.wq", "q", "xb");
-    emit_matvec(out, &l.wk, "l.wk", "k", "xb");
-    emit_matvec(out, &l.wv, "l.wv", "v", "xb");
+    let same = l.wq.kind == l.wk.kind && l.wk.kind == l.wv.kind && l.wq.kind.activation() != Activation::F32;
+    if same {
+        let (fn_name, dot_fn) = match l.wq.kind.activation() {
+            Activation::Q8_K => ("matvec3_q8_k_input", "dot_fn_q8_k"),
+            _ => ("matvec3_q8_0_input", "dot_fn_q8_0"),
+        };
+        let kn = l.wq.kind.rust_name();
+        writeln!(
+            out,
+            "    {fn_name}(pool, [&mut s.q, &mut s.k, &mut s.v], [w.bytes(&l.wq), w.bytes(&l.wk), w.bytes(&l.wv)], {}, [{}, {}, {}], Kind::{kn}.row_bytes({}), {dot_fn}(Kind::{kn}));",
+            act_expr(l.wq.kind.activation(), "xb"),
+            l.wq.rows,
+            l.wk.rows,
+            l.wv.rows,
+            l.wq.cols
+        )
+        .unwrap();
+    } else {
+        emit_matvec(out, &l.wq, "l.wq", "q", "xb");
+        emit_matvec(out, &l.wk, "l.wk", "k", "xb");
+        emit_matvec(out, &l.wv, "l.wv", "v", "xb");
+    }
     writeln!(out, "    rope(&mut s.q, {}, {}, {}, &s.rope_cs);", d.n_head, d.head_dim, d.rot_dim).unwrap();
     writeln!(out, "    rope(&mut s.k, {}, {}, {}, &s.rope_cs);", d.n_kv_head, d.head_dim, d.rot_dim).unwrap();
     writeln!(out, "    store_kv(&mut s.k_cache, &mut s.v_cache, &s.k, &s.v, &DIMS, s.ctx, {i}, pos);").unwrap();

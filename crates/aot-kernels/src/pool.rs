@@ -92,6 +92,31 @@ impl Pool {
     }
 }
 
+impl Pool {
+    /// Run `f` over `0..n` in chunks of `chunk` items handed out dynamically
+    /// (work stealing by atomic counter). Threads that finish early pick up
+    /// more chunks, so uneven memory latency or a preempted worker does not
+    /// stall the whole region the way a static split does.
+    pub fn run_chunks(&self, n: usize, chunk: usize, f: &(dyn Fn(std::ops::Range<usize>) + Sync)) {
+        let chunk = chunk.max(1);
+        if n == 0 {
+            return;
+        }
+        if self.shared.n_threads == 1 || n <= chunk {
+            f(0..n);
+            return;
+        }
+        let next = AtomicUsize::new(0);
+        self.run(&|_, _| loop {
+            let start = next.fetch_add(chunk, Ordering::Relaxed);
+            if start >= n {
+                break;
+            }
+            f(start..(start + chunk).min(n));
+        });
+    }
+}
+
 impl Drop for Pool {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
@@ -227,6 +252,26 @@ mod tests {
                 }
                 assert_eq!(total, n);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn run_chunks_covers_every_index_once() {
+        let pool = Pool::new(4);
+        for (n, chunk) in [(0usize, 8usize), (5, 8), (100, 7), (1000, 16)] {
+            let hits: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+            pool.run_chunks(n, chunk, &|r| {
+                for i in r {
+                    hits[i].fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1), "n={n} chunk={chunk}");
         }
     }
 }

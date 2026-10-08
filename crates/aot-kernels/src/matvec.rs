@@ -285,13 +285,65 @@ fn matvec_rows<T: Sync>(
     assert!(out.len() >= rows, "output too small: {} < {rows}", out.len());
     assert!(w.len() >= rows * row_bytes, "weight slice too small: {} < {}", w.len(), rows * row_bytes);
     let o = SendPtr(out.as_mut_ptr());
-    pool.run(&|tid, nth| {
-        for r in split(rows, tid, nth) {
+    pool.run_chunks(rows, row_chunk(rows, pool.n_threads()), &|range| {
+        for r in range {
             let v = dot(&w[r * row_bytes..(r + 1) * row_bytes], x);
-            // SAFETY: rows are partitioned disjointly across threads.
+            // SAFETY: chunks are disjoint and each row is written once.
             unsafe { o.write(r, v) };
         }
     });
+}
+
+/// Chunk size for dynamically scheduled row loops: about eight chunks per
+/// thread, never fewer than 8 rows.
+#[inline]
+fn row_chunk(rows: usize, nth: usize) -> usize {
+    (rows / (nth * 8)).max(8)
+}
+
+/// Three products sharing one input and one kernel (the q/k/v projections),
+/// issued as a single parallel region over the concatenated row space.
+#[allow(clippy::too_many_arguments)]
+fn matvec3_rows<T: Sync>(
+    pool: &Pool,
+    outs: [&mut [f32]; 3],
+    ws: [&[u8]; 3],
+    x: &[T],
+    rows: [usize; 3],
+    row_bytes: usize,
+    dot: fn(&[u8], &[T]) -> f32,
+) {
+    for i in 0..3 {
+        assert!(outs[i].len() >= rows[i] && ws[i].len() >= rows[i] * row_bytes, "q/k/v buffers too small");
+    }
+    let o = [SendPtr(outs[0].as_mut_ptr()), SendPtr(outs[1].as_mut_ptr()), SendPtr(outs[2].as_mut_ptr())];
+    let total = rows[0] + rows[1] + rows[2];
+    pool.run_chunks(total, row_chunk(total, pool.n_threads()), &|range| {
+        for r in range {
+            let (t, lr) = if r < rows[0] {
+                (0, r)
+            } else if r < rows[0] + rows[1] {
+                (1, r - rows[0])
+            } else {
+                (2, r - rows[0] - rows[1])
+            };
+            let v = dot(&ws[t][lr * row_bytes..(lr + 1) * row_bytes], x);
+            // SAFETY: each (tensor, row) is written exactly once.
+            unsafe { o[t].write(lr, v) };
+        }
+    });
+}
+
+/// Fused q/k/v projections for K-quant weights of one kind.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec3_q8_k_input(pool: &Pool, outs: [&mut [f32]; 3], ws: [&[u8]; 3], x: &[BlockQ8_K], rows: [usize; 3], row_bytes: usize, dot: fn(&[u8], &[BlockQ8_K]) -> f32) {
+    matvec3_rows(pool, outs, ws, x, rows, row_bytes, dot);
+}
+
+/// Fused q/k/v projections for Q4_0 / Q8_0 weights of one kind.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec3_q8_0_input(pool: &Pool, outs: [&mut [f32]; 3], ws: [&[u8]; 3], x: &[BlockQ8_0], rows: [usize; 3], row_bytes: usize, dot: fn(&[u8], &[BlockQ8_0]) -> f32) {
+    matvec3_rows(pool, outs, ws, x, rows, row_bytes, dot);
 }
 
 /// `out[r] = sum_c W[r][c] * x[c]` for Q4_0 weights, `x` pre-quantized to Q8_0.
@@ -354,9 +406,9 @@ pub fn matvec2_q8_k_input(
     assert!(w_a.len() >= rows * row_bytes && w_b.len() >= rows * row_bytes);
     let oa = SendPtr(out_a.as_mut_ptr());
     let ob = SendPtr(out_b.as_mut_ptr());
-    pool.run(&|tid, nth| {
-        for r in split(rows, tid, nth) {
-            // SAFETY: disjoint row ranges per thread.
+    pool.run_chunks(rows, row_chunk(rows, pool.n_threads()), &|range| {
+        for r in range {
+            // SAFETY: disjoint chunks; each row written once per output.
             unsafe {
                 oa.write(r, dot(&w_a[r * row_bytes..(r + 1) * row_bytes], x));
                 ob.write(r, dot(&w_b[r * row_bytes..(r + 1) * row_bytes], x));
@@ -382,9 +434,9 @@ pub fn matvec2_q8_0_input(
     assert!(w_a.len() >= rows * row_bytes && w_b.len() >= rows * row_bytes);
     let oa = SendPtr(out_a.as_mut_ptr());
     let ob = SendPtr(out_b.as_mut_ptr());
-    pool.run(&|tid, nth| {
-        for r in split(rows, tid, nth) {
-            // SAFETY: disjoint row ranges per thread.
+    pool.run_chunks(rows, row_chunk(rows, pool.n_threads()), &|range| {
+        for r in range {
+            // SAFETY: disjoint chunks; each row written once per output.
             unsafe {
                 oa.write(r, dot(&w_a[r * row_bytes..(r + 1) * row_bytes], x));
                 ob.write(r, dot(&w_b[r * row_bytes..(r + 1) * row_bytes], x));

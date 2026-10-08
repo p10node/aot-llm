@@ -61,6 +61,44 @@ pub fn prefetch(data: &[u8]) {
     }
 }
 
+/// Page in `data` from background threads while the caller keeps working.
+///
+/// A cold start otherwise pays one page fault per 16 KiB page, serially, on
+/// the thread that first touches each weight (and on macOS each page of a
+/// signed executable is also hash-verified on first fault). Touching the
+/// pages from `n_threads` detached threads overlaps that work with
+/// tokenization and lets the first forward pass find most pages resident.
+/// The threads exit when they are done; nothing waits for them.
+pub fn prefault_background(data: &'static [u8], n_threads: usize) {
+    if data.is_empty() {
+        return;
+    }
+    let n = n_threads.max(1);
+    let chunk = data.len().div_ceil(n);
+    for t in 0..n {
+        let start = (t * chunk).min(data.len());
+        let end = ((t + 1) * chunk).min(data.len());
+        if start >= end {
+            break;
+        }
+        let part = &data[start..end];
+        let _ = std::thread::Builder::new().name(format!("aot-prefault-{t}")).spawn(move || {
+            // MADV_WILLNEED is synchronous on macOS (it reads the range before
+            // returning), so issue it per chunk from the worker, not the caller.
+            prefetch(part);
+            let mut acc = 0u8;
+            let mut i = 0;
+            while i < part.len() {
+                // Volatile read so the loop is not optimised away.
+                // SAFETY: `i` is within `part`.
+                acc ^= unsafe { std::ptr::read_volatile(part.as_ptr().add(i)) };
+                i += 4096;
+            }
+            std::hint::black_box(acc);
+        });
+    }
+}
+
 /// Peak resident set size in bytes, if the platform exposes it.
 pub fn peak_rss_bytes() -> Option<u64> {
     #[cfg(unix)]

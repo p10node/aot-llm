@@ -55,7 +55,7 @@ struct Args {
     chat: bool,
     system: Option<String>,
     no_bos: bool,
-    prefetch: bool,
+    no_prefetch: bool,
     kernels: Option<String>,
     weights_path: Option<PathBuf>,
     quiet: bool,
@@ -84,7 +84,7 @@ Options:
       --chat               Wrap the prompt in the model's chat template
       --system TEXT        System prompt for --chat
       --no-bos             Do not prepend the BOS token
-      --prefetch           Advise the OS to page in all weights up front
+      --no-prefetch        Do not page in the weights from background threads at startup
       --kernels NAME       auto|scalar|neon|neon-dotprod|avx2
       --weights PATH       Sidecar weights file (sidecar builds only)
       --show-special       Print special tokens
@@ -108,7 +108,7 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
         chat: false,
         system: None,
         no_bos: false,
-        prefetch: false,
+        no_prefetch: false,
         kernels: None,
         weights_path: None,
         quiet: false,
@@ -141,7 +141,8 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
             "--chat" => a.chat = true,
             "--system" => a.system = Some(next(&mut i, f)?),
             "--no-bos" => a.no_bos = true,
-            "--prefetch" => a.prefetch = true,
+            "--no-prefetch" => a.no_prefetch = true,
+            "--prefetch" => {}
             "--kernels" => a.kernels = Some(next(&mut i, f)?),
             "--weights" => a.weights_path = Some(PathBuf::from(next(&mut i, f)?)),
             "--show-special" => a.show_special = true,
@@ -257,6 +258,12 @@ pub fn main(rt: Runtime) -> i32 {
         return 1;
     }
     let weights = Weights::new(wbytes);
+    let threads = args.threads.unwrap_or_else(default_threads).max(1);
+    if !args.no_prefetch && !args.info {
+        // Overlaps page-in with tokenization and pool start-up; see
+        // `weights::prefault_background`.
+        weights::prefault_background(&wbytes[..rt.info.weights_len], threads);
+    }
     if let Some(name) = &args.kernels {
         match matvec::kernels_by_name(name) {
             Some(k) => {
@@ -268,7 +275,6 @@ pub fn main(rt: Runtime) -> i32 {
             }
         }
     }
-    let threads = args.threads.unwrap_or_else(default_threads).max(1);
     let t_pool0 = Instant::now();
     let pool = Pool::new(threads);
     let t_pool = t_pool0.elapsed();
@@ -325,10 +331,6 @@ pub fn main(rt: Runtime) -> i32 {
     let mut state = State::new(d, ctx, rope_ff, threads, batch);
     // The baked prefix must fit in the context together with the prompt.
     let t_ready = t0.elapsed();
-
-    if args.prefetch {
-        weights::prefetch(&wbytes[..rt.info.weights_len]);
-    }
 
     // Compile-time KV prefix: skip the tokens whose cache is embedded.
     let mut cached = 0usize;

@@ -20,6 +20,26 @@ $ ./tinyllama_bin --prompt "The capital of France is" -n 32
 
 The output is byte-for-byte identical to llama.cpp (via Ollama) for the same GGUF under greedy decoding.
 
+## Where it wins, and where it does not
+
+aot-llm is about **first-response latency and packaging**, not raw throughput. Same GGUF, same Apple M1 Pro, 8 threads (details in [`docs/benchmarks/`](docs/benchmarks/README.md)):
+
+| | aot-llm | Ollama / llama.cpp |
+|---|---|---|
+| process start → ready to decode | **0.2–0.8 ms** | 0.5–2.8 s model load, and the server must already be running |
+| chat reply with a fixed system prompt, first token (warm) | **90–160 ms** (baked KV prefix) | ~500–780 ms per request (CPU), ~470 ms (Metal) |
+| cold first token (nothing in the page cache) | 0.6–0.7 s | 1.3–4.6 s |
+| resident memory | 614–773 MiB | 766–1586 MiB plus ~40 MiB of server/app |
+| decode, CPU | **113–128 tok/s** | 86–117 tok/s |
+| decode, GPU | none | 139–150 tok/s (Metal) |
+| long prompt evaluation | 200–260 tok/s | 410–510 tok/s |
+| deployment | one file, no runtime, no daemon; copy and run; static Linux cross-build | install Ollama, pull the model, keep a server up |
+| models | `llama` architecture, 8 tensor types | every architecture and quantization |
+
+**Good fit:** command-line tools, agents that call a model many times for short answers, edge / serverless / cron jobs where a process spawns, answers and exits, embedding a model in an application.
+
+**Poor fit:** multi-user chat servers, very long prompts (RAG, documents), anything that needs a GPU. vLLM and friends solve a different problem (batched GPU serving, cold starts of tens of seconds) and are not comparable for one process answering one request.
+
 ## What it does
 
 * **Zero runtime overhead.** The generated program depends only on `std`. Argument parsing, tokenizer, kernels, sampler: all compiled into one static binary (`opt-level=3`, fat LTO, one codegen unit, `panic=abort`, stripped).

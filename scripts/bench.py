@@ -40,8 +40,9 @@ CHAT_PROMPT = "What does a compiler do?"
 STATS = {
     "startup_ms": re.compile(r"startup ([\d.]+) ms"),
     "prompt_tokens": re.compile(r"prompt (\d+) tok"),
-    "prompt_s": re.compile(r"prompt \d+ tok / ([\d.]+) s"),
-    "prompt_tps": re.compile(r"prompt \d+ tok / [\d.]+ s \(([\d.]+) tok/s\)"),
+    "prompt_cached": re.compile(r"prompt \d+ tok \((\d+) cached\)"),
+    "prompt_s": re.compile(r"prompt \d+ tok(?: \(\d+ cached\))? / ([\d.]+) s"),
+    "prompt_tps": re.compile(r"prompt \d+ tok(?: \(\d+ cached\))? / [\d.]+ s \(([\d.]+) tok/s\)"),
     "gen_tokens": re.compile(r"gen (\d+) tok"),
     "gen_tps": re.compile(r"gen \d+ tok / [\d.]+ s \(([\d.]+) tok/s\)"),
     "first_token_ms": re.compile(r"first token ([\d.]+) ms"),
@@ -127,6 +128,7 @@ def bench_binary(name: str, path: str, runs: int, threads: int, ctx_extra: list[
         },
         "chat": {
             "prompt_tokens": chat[0].get("prompt_tokens"),
+            "prompt_cached": chat[0].get("prompt_cached", 0),
             "first_token_ms": med(chat, "first_token_ms"),
             "first_token_ms_min": min(r["first_token_ms"] for r in chat),
             "prompt_tps": med(chat, "prompt_tps"),
@@ -188,10 +190,10 @@ def write_markdown(res: dict, path: pathlib.Path) -> None:
     L.append(f"* Method: `scripts/bench.py` — prompt `{PROMPT!r}`, 64 generated tokens, greedy, {res['runs']} warm runs (medians), "
              f"cold = F_NOCACHE copy of the binary run once. Chat = `--chat --system <~60 tokens>`, 16 tokens.\n")
     L.append("## Startup and time to first token\n")
-    L.append("| binary | startup (ms) | cold first token (ms) | warm first token (ms) | chat first token (ms) | chat prompt tokens |")
+    L.append("| binary | startup (ms) | cold first token (ms) | warm first token (ms) | chat first token (ms) | chat prompt tokens (cached) |")
     L.append("|---|---|---|---|---|---|")
     for b in res["binaries"]:
-        L.append(f"| {b['name']} | {fmt(b['warm']['startup_ms'], 3)} | {fmt(b['cold']['first_token_ms'], 0)} | {fmt(b['warm']['first_token_ms'], 0)} | {fmt(b['chat']['first_token_ms'], 0)} | {fmt(b['chat']['prompt_tokens'])} |")
+        L.append(f"| {b['name']} | {fmt(b['warm']['startup_ms'], 3)} | {fmt(b['cold']['first_token_ms'], 0)} | {fmt(b['warm']['first_token_ms'], 0)} | {fmt(b['chat']['first_token_ms'], 0)} | {fmt(b['chat']['prompt_tokens'])} ({fmt(b['chat'].get('prompt_cached', 0))}) |")
     L.append("\n## Throughput and memory\n")
     L.append("| binary | prompt tok/s (warm) | chat prompt tok/s | decode tok/s (median) | decode min–max | peak RSS (MiB) | binary (MiB) | kernels / threads |")
     L.append("|---|---|---|---|---|---|---|---|")

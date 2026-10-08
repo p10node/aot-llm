@@ -21,3 +21,6 @@ Throughput columns show the median of the warm runs and, in parentheses, the bes
 | 5 | [decode-tuning](05-decode-tuning.md) | `89784d4` | tinyllama_q4km | 0.440 | 606 | 68 | 436 (355) | 201.7 (247.8) | 127.7 (131.1) | 644 | 7.61 |
 | 5 | [decode-tuning](05-decode-tuning.md) | `89784d4` | tinyllama_q40 | 0.418 | 580 | 60 | 341 (296) | 257.9 (296.9) | 120.7 (142.7) | 614 | 7.61 |
 | 5 | [decode-tuning](05-decode-tuning.md) | `89784d4` | llama32_1b_q4km | 2.003 | 704 | 64 | 298 (280) | 235.1 (250.2) | 113.2 (113.3) | 773 | 7.61 |
+| 6 | [baked-prefix](06-baked-prefix.md) | `bbdef96` | tinyllama_q4km | 0.525 | 624 | 78 | 164 (120) | 134.2 (184.1) | 112.1 (118.1) | 644 | 4.72 |
+| 6 | [baked-prefix](06-baked-prefix.md) | `bbdef96` | tinyllama_q40 | 0.438 | 606 | 59 | 95 (89) | 232.6 (248.5) | 135.6 (138.3) | 614 | 4.72 |
+| 6 | [baked-prefix](06-baked-prefix.md) | `bbdef96` | llama32_1b_q4km | 0.784 | 721 | 74 | 90 (76) | 167.9 (197.1) | 92.4 (102.9) | 773 | 4.72 |

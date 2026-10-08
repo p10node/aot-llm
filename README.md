@@ -141,7 +141,17 @@ Prompt tokens are processed by `forward_batch` in chunks: every weight row is lo
 
 ## Benchmarks
 
-The tables below are the initial measurements of the first release. Every later optimisation step is measured with `scripts/bench.py` and recorded under [`docs/benchmarks/`](docs/benchmarks/README.md) (one file per step, cold/warm/chat columns, plus the Ollama reference).
+The tables below are the initial measurements of the first release. Every later optimisation step is measured with `scripts/bench.py` and recorded under [`docs/benchmarks/`](docs/benchmarks/README.md) (one file per step, cold/warm/chat columns, plus the Ollama reference). Summary of the steps so far (Apple M1 Pro, 8 threads, medians; "chat" = 88-token prompt with a 66-token system prompt for TinyLlama, 70/55 for Llama 3.2):
+
+| step | TinyLlama Q4_K_M chat first token | Llama-3.2-1B chat first token | TinyLlama decode | Llama-3.2-1B decode |
+|---|---|---|---|---|
+| baseline (`bf6f95b`) | 685 ms | 777 ms | 104 tok/s | 61–87 tok/s |
+| batched prompt + 1x4 micro-kernels | 424 ms | 488 ms | 116 tok/s | 83 tok/s |
+| + background prefault | 375 ms (cold first token 652 → 642 ms) | 302 ms (1030 → 711 ms) | 114 tok/s | 93 tok/s |
+| + fused q/k/v, dynamic chunks, `fcvt` scales | 436 ms | 298 ms | **128 tok/s** | **113 tok/s** |
+| + baked system-prompt KV cache (`--system`) | **164 ms** | **90 ms** | 128 tok/s | 113 tok/s |
+
+Decode is now at llama.cpp's CPU speed (117 / 86 tok/s in Ollama), and a chat reply with a baked system prompt starts in about 100 ms instead of 700–1000 ms. The baseline tables that follow are kept for reference.
 
 Machine: Apple M1 Pro (8 performance + 2 efficiency cores, 16 GB), macOS, Rust 1.99. Prompt: 11-13 tokens, 64 generated tokens, greedy, warm page cache, 8 threads, median of 3 runs on an otherwise idle machine. Ollama 0.34.4 with its bundled llama.cpp `llama-server`, same GGUF files imported with `ollama create`, measured through `/api/generate` (`raw: true`); "cold" means after `ollama stop`.
 

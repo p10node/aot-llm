@@ -1,0 +1,128 @@
+{
+  "label": "baked-prefix",
+  "date": "2026-10-09",
+  "git": {
+    "commit": "bbdef96",
+    "subject": "docs: benchmarks for batched x4, prefault and decode tuning",
+    "dirty": true
+  },
+  "machine": {
+    "platform": "darwin",
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cpu": "Apple M1 Pro",
+    "cores": "10",
+    "ram_gib": 16,
+    "os": "macOS 27.0.1",
+    "load_avg": [
+      4.72,
+      3.87,
+      3.06
+    ]
+  },
+  "runs": 5,
+  "notes": "Step A on top of B+C+D: binaries compiled with --system \"$(cat scripts/chat_system.txt)\", i.e. the KV cache of the benchmark's own system prompt is baked in. Only the chat columns change: the cached prefix (66 / 66 / 55 tokens) is skipped and just the user turn is evaluated; chat prompt tok/s counts evaluated tokens only. Raw-prompt columns are unaffected and serve as a control.",
+  "binaries": [
+    {
+      "name": "tinyllama_q4km",
+      "path": "/Users/pierreneter/WD/workplace--pierreneter/oss/aot-llm/out/tinyllama_sys",
+      "binary_mib": 645.3,
+      "threads": 8,
+      "kernels": "neon+dotprod",
+      "cold": {
+        "startup_ms": 4.151,
+        "first_token_ms": 624.3,
+        "prompt_tokens": 13,
+        "prompt_tps": 20.8,
+        "gen_tps": 70.1,
+        "peak_rss_mib": 643
+      },
+      "warm": {
+        "startup_ms": 0.525,
+        "first_token_ms": 77.9,
+        "prompt_tokens": 13,
+        "prompt_tps": 167.0,
+        "gen_tps": 112.1,
+        "gen_tps_min": 100.3,
+        "gen_tps_max": 118.1,
+        "peak_rss_mib": 644
+      },
+      "chat": {
+        "prompt_tokens": 88,
+        "prompt_cached": 66,
+        "first_token_ms": 164.0,
+        "first_token_ms_min": 119.5,
+        "prompt_tps": 134.2,
+        "prompt_tps_max": 184.1
+      },
+      "sample_output": "it is a funny story.\n\n2. The Tale of the Three Little Pigs:\n\nThe Tale of the Three Little Pigs is a classic fairy tale t"
+    },
+    {
+      "name": "tinyllama_q40",
+      "path": "/Users/pierreneter/WD/workplace--pierreneter/oss/aot-llm/out/tinyllama_q40_sys",
+      "binary_mib": 615.4,
+      "threads": 8,
+      "kernels": "neon+dotprod",
+      "cold": {
+        "startup_ms": 5.434,
+        "first_token_ms": 605.9,
+        "prompt_tokens": 13,
+        "prompt_tps": 21.5,
+        "gen_tps": 80.6,
+        "peak_rss_mib": 614
+      },
+      "warm": {
+        "startup_ms": 0.438,
+        "first_token_ms": 59.3,
+        "prompt_tokens": 13,
+        "prompt_tps": 219.3,
+        "gen_tps": 135.6,
+        "gen_tps_min": 114.9,
+        "gen_tps_max": 138.3,
+        "peak_rss_mib": 614
+      },
+      "chat": {
+        "prompt_tokens": 88,
+        "prompt_cached": 66,
+        "first_token_ms": 94.6,
+        "first_token_ms_min": 88.6,
+        "prompt_tps": 232.6,
+        "prompt_tps_max": 248.5
+      },
+      "sample_output": "it's a funny poem.\n\n2. \"The Grapes of Wrath\" by John Steinbeck: This classic novel is a powerful and poignant exploratio"
+    },
+    {
+      "name": "llama32_1b_q4km",
+      "path": "/Users/pierreneter/WD/workplace--pierreneter/oss/aot-llm/out/llama32_sys",
+      "binary_mib": 779.8,
+      "threads": 8,
+      "kernels": "neon+dotprod",
+      "cold": {
+        "startup_ms": 24.02,
+        "first_token_ms": 720.9,
+        "prompt_tokens": 11,
+        "prompt_tps": 15.3,
+        "gen_tps": 98.8,
+        "peak_rss_mib": 773
+      },
+      "warm": {
+        "startup_ms": 0.784,
+        "first_token_ms": 74.1,
+        "prompt_tokens": 11,
+        "prompt_tps": 148.9,
+        "gen_tps": 92.4,
+        "gen_tps_min": 74.2,
+        "gen_tps_max": 102.9,
+        "peak_rss_mib": 773
+      },
+      "chat": {
+        "prompt_tokens": 70,
+        "prompt_cached": 55,
+        "first_token_ms": 89.5,
+        "first_token_ms_min": 76.3,
+        "prompt_tps": 167.9,
+        "prompt_tps_max": 197.1
+      },
+      "sample_output": "the fox is faster than the dog. This is a classic example of a lateral thinking puzzle, which requires the solver to thi"
+    }
+  ]
+}

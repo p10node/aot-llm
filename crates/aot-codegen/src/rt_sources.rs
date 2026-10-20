@@ -8,6 +8,8 @@ pub const RT_SOURCES: &[(&str, &str)] = &[
     ("app.rs", include_str!("../../aot-kernels/src/app.rs")),
     ("chat.rs", include_str!("../../aot-kernels/src/chat.rs")),
     ("matvec.rs", include_str!("../../aot-kernels/src/matvec.rs")),
+    ("metal.rs", include_str!("../../aot-kernels/src/metal.rs")),
+    ("shaders.metal", include_str!("../../aot-kernels/src/shaders.metal")),
     ("simd_neon.rs", include_str!("../../aot-kernels/src/simd_neon.rs")),
     ("simd_avx2.rs", include_str!("../../aot-kernels/src/simd_avx2.rs")),
     ("ops.rs", include_str!("../../aot-kernels/src/ops.rs")),

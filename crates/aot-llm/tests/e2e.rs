@@ -91,9 +91,11 @@ fn act_quant(kind: Kind, x: &[f32]) -> Vec<f32> {
     }
 }
 
-fn matvec(m: &Mat, x: &[f32]) -> Vec<f32> {
+/// `quant_acts`: apply the CPU path's activation quantization (the GPU path
+/// multiplies f32 activations directly).
+fn matvec(m: &Mat, x: &[f32], quant_acts: bool) -> Vec<f32> {
     assert_eq!(x.len(), m.cols);
-    let xq = act_quant(m.kind, x);
+    let xq = if quant_acts { act_quant(m.kind, x) } else { x.to_vec() };
     (0..m.rows).map(|r| (0..m.cols).map(|c| m.f32[r * m.cols + c] * xq[c]).sum()).collect()
 }
 
@@ -136,7 +138,7 @@ struct Model {
 }
 
 /// Reference forward over a token sequence; returns logits of the last token.
-fn reference_logits(m: &Model, tokens: &[u32]) -> Vec<f32> {
+fn reference_logits(m: &Model, tokens: &[u32], quant_acts: bool) -> Vec<f32> {
     let kv_dim = N_KV_HEAD * HEAD_DIM;
     let mut k_cache = vec![vec![0f32; tokens.len() * kv_dim]; N_LAYER];
     let mut v_cache = vec![vec![0f32; tokens.len() * kv_dim]; N_LAYER];
@@ -145,9 +147,9 @@ fn reference_logits(m: &Model, tokens: &[u32]) -> Vec<f32> {
         let mut x: Vec<f32> = m.embd.f32[t as usize * DIM..(t as usize + 1) * DIM].to_vec();
         for (li, l) in m.layers.iter().enumerate() {
             let xb = rmsnorm(&x, &l.attn_norm);
-            let mut q = matvec(&l.wq, &xb);
-            let mut k = matvec(&l.wk, &xb);
-            let v = matvec(&l.wv, &xb);
+            let mut q = matvec(&l.wq, &xb, quant_acts);
+            let mut k = matvec(&l.wk, &xb, quant_acts);
+            let v = matvec(&l.wv, &xb, quant_acts);
             rope(&mut q, N_HEAD, pos);
             rope(&mut k, N_KV_HEAD, pos);
             k_cache[li][pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&k);
@@ -175,22 +177,22 @@ fn reference_logits(m: &Model, tokens: &[u32]) -> Vec<f32> {
                     }
                 }
             }
-            let o = matvec(&l.wo, &att);
+            let o = matvec(&l.wo, &att, quant_acts);
             for i in 0..DIM {
                 x[i] += o[i];
             }
             let xb = rmsnorm(&x, &l.ffn_norm);
-            let g = matvec(&l.gate, &xb);
-            let u = matvec(&l.up, &xb);
+            let g = matvec(&l.gate, &xb, quant_acts);
+            let u = matvec(&l.up, &xb, quant_acts);
             let hbuf: Vec<f32> = g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
-            let d = matvec(&l.down, &hbuf);
+            let d = matvec(&l.down, &hbuf, quant_acts);
             for i in 0..DIM {
                 x[i] += d[i];
             }
         }
         if pos + 1 == tokens.len() {
             let xb = rmsnorm(&x, &m.output_norm);
-            logits = matvec(&m.output, &xb);
+            logits = matvec(&m.output, &xb, quant_acts);
         }
     }
     logits
@@ -314,7 +316,7 @@ fn compile_run_and_match_reference() {
     let prompt = vec!["the capital of hello world is"; repeat].join(" ");
     let ids = tok.encode(&prompt, true, true);
     assert_eq!(ids.len(), 1 + 6 * repeat, "{ids:?}");
-    let expected = reference_logits(&model, &ids);
+    let expected = reference_logits(&model, &ids, true);
 
     let status = Command::new(env!("CARGO_BIN_EXE_aot-llm"))
         .args(["compile", "--model"])
@@ -347,4 +349,42 @@ fn compile_run_and_match_reference() {
     assert!(gen.status.success());
     let n = String::from_utf8_lossy(&gen.stdout).split_whitespace().count();
     assert!((1..=8).contains(&n), "generated {n} tokens");
+
+    // Same model with the Metal backend: the GPU uses f32 activations, so it
+    // is compared against the unquantized reference.
+    #[cfg(target_os = "macos")]
+    {
+        let out_gpu = tmp.join("tiny_gpu");
+        let status = Command::new(env!("CARGO_BIN_EXE_aot-llm"))
+            .args(["compile", "--model"])
+            .arg(&gguf_path)
+            .arg("--output")
+            .arg(&out_gpu)
+            .args(["--quiet", "--gpu", "metal"])
+            .status()
+            .expect("running aot-llm");
+        assert!(status.success(), "aot-llm compile --gpu metal failed");
+        let expected = reference_logits(&model, &ids, false);
+        for batch in ["1", "128"] {
+            let run = Command::new(&out_gpu).args(["--prompt", &prompt, "--dump-logits", "--quiet", "--batch", batch, "--device", "gpu"]).output().expect("running compiled binary");
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            if !run.status.success() && (stderr.contains("no Metal device") || stderr.contains("cannot load")) {
+                eprintln!("skipping the GPU check: {}", stderr.trim());
+                return;
+            }
+            assert!(run.status.success(), "gpu binary failed: {stderr}");
+            let got: Vec<f32> = String::from_utf8_lossy(&run.stdout).split_whitespace().map(|v| v.parse().unwrap()).collect();
+            assert_eq!(got.len(), expected.len());
+            let max_abs = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let max_err = got.iter().zip(&expected).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+            eprintln!("gpu batch {batch}: max |logit| {max_abs:.3}, max abs error {max_err:.4}, argmax {} vs {}", argmax(&got), argmax(&expected));
+            assert!(max_err <= 2e-3 * max_abs + 1e-3, "gpu batch {batch}: logits differ: max error {max_err} (range {max_abs})");
+            assert_eq!(argmax(&got), argmax(&expected));
+        }
+        let gen = Command::new(&out_gpu).args(["--prompt", &prompt, "-n", "8", "--tokens", "--quiet", "--device", "gpu"]).output().unwrap();
+        assert!(gen.status.success(), "{}", String::from_utf8_lossy(&gen.stderr));
+        let n = String::from_utf8_lossy(&gen.stdout).split_whitespace().count();
+        assert!((1..=8).contains(&n), "gpu generated {n} tokens");
+    }
 }

@@ -8,7 +8,7 @@ use std::path::Path;
 mod sys {
     use std::os::raw::{c_int, c_void};
     pub const PROT_READ: c_int = 1;
-    pub const MAP_PRIVATE: c_int = 2;
+    pub const MAP_SHARED: c_int = 1;
     pub const MADV_WILLNEED: c_int = 3;
     extern "C" {
         pub fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) -> *mut c_void;
@@ -17,22 +17,77 @@ mod sys {
 }
 
 /// Map `path` read-only for the rest of the process lifetime.
+///
+/// The mapping is `MAP_SHARED`: for a read-only mapping that changes nothing
+/// for the CPU, but it lets a GPU wire the pages directly instead of
+/// copying every page on first use (a private mapping would be copied).
 #[cfg(unix)]
 pub fn mmap_file(path: &Path) -> std::io::Result<&'static [u8]> {
-    use std::os::unix::io::AsRawFd;
     let f = std::fs::File::open(path)?;
     let len = f.metadata()?.len() as usize;
+    map_range(&f, 0, len)
+}
+
+/// Map `len` bytes of `f` starting at the page-aligned file offset `off`.
+#[cfg(unix)]
+fn map_range(f: &std::fs::File, off: u64, len: usize) -> std::io::Result<&'static [u8]> {
+    use std::os::unix::io::AsRawFd;
     if len == 0 {
         return Ok(&[]);
     }
-    // SAFETY: standard read-only private mapping of a regular file; the fd
+    // SAFETY: standard read-only shared mapping of a regular file; the fd
     // may be closed afterwards, the mapping stays valid. The returned slice
     // is never unmapped, hence 'static.
-    let p = unsafe { sys::mmap(std::ptr::null_mut(), len, sys::PROT_READ, sys::MAP_PRIVATE, f.as_raw_fd(), 0) };
+    let p = unsafe { sys::mmap(std::ptr::null_mut(), len, sys::PROT_READ, sys::MAP_SHARED, f.as_raw_fd(), off as i64) };
     if p as usize == usize::MAX {
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { std::slice::from_raw_parts(p as *const u8, len) })
+}
+
+/// Map a section of the running executable from the file it was loaded
+/// from (`MAP_SHARED`, read-only), returning its first `len` bytes.
+///
+/// The loader already maps every segment, but privately: when a GPU wires
+/// such pages they are copied first (hundreds of milliseconds for a model),
+/// and on `__TEXT` the CPU can no longer read them afterwards because the
+/// copies fail code-signature validation. A fresh shared mapping of the
+/// same file bytes has neither problem and shares the page cache with the
+/// loader's mapping, so nothing is read twice.
+#[cfg(target_os = "macos")]
+pub fn map_own_section(segment: &str, section: &str, len: usize) -> std::io::Result<&'static [u8]> {
+    use std::ffi::CString;
+    use std::io::{Error, ErrorKind};
+    #[repr(C)]
+    struct Section64 {
+        sectname: [u8; 16],
+        segname: [u8; 16],
+        addr: u64,
+        size: u64,
+        offset: u32,
+        align: u32,
+        reloff: u32,
+        nreloc: u32,
+        flags: u32,
+        reserved: [u32; 3],
+    }
+    extern "C" {
+        fn getsectbyname(segname: *const std::os::raw::c_char, sectname: *const std::os::raw::c_char) -> *const Section64;
+    }
+    const PAGE: u64 = 16384;
+    let seg = CString::new(segment)?;
+    let sect = CString::new(section)?;
+    // SAFETY: looks the section up in the main executable's load commands.
+    let sc = unsafe { getsectbyname(seg.as_ptr(), sect.as_ptr()) };
+    if sc.is_null() {
+        return Err(Error::new(ErrorKind::NotFound, format!("section {segment},{section} not found")));
+    }
+    let (off, size) = unsafe { ((*sc).offset as u64, (*sc).size as usize) };
+    if size < len || off % PAGE != 0 {
+        return Err(Error::new(ErrorKind::InvalidData, format!("section {segment},{section}: size {size}, file offset {off}")));
+    }
+    let f = std::fs::File::open(std::env::current_exe()?)?;
+    map_range(&f, off, len)
 }
 
 /// Fallback for non-unix targets: read the file into a leaked buffer.

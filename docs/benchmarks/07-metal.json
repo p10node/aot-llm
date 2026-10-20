@@ -1,0 +1,162 @@
+{
+  "label": "metal",
+  "date": "2026-10-20",
+  "git": {
+    "commit": "c032656",
+    "subject": "chore: update gitignore and remove target build artifacts",
+    "dirty": true
+  },
+  "machine": {
+    "platform": "darwin",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "cpu": "Apple M1 Pro",
+    "cores": "10",
+    "ram_gib": 16,
+    "os": "macOS 27.0.1",
+    "load_avg": [
+      4.55,
+      15.08,
+      40.19
+    ]
+  },
+  "runs": 5,
+  "notes": "Step E: Metal GPU backend (`aot-llm compile --gpu metal`). The *_metal binaries run the transformer on the GPU: weights mapped zero-copy from the executable's own section, activations and KV cache shared with the CPU, one command buffer per token with 8 dispatches per layer (RoPE, the SwiGLU product and the residual adds fused into the quantized matrix products), and prompt batches as a simdgroup-matrix GEMM. The other two binaries are the same models compiled without a GPU backend, as a control; all four have the benchmark's system prompt baked in. Startup of the GPU binaries includes Metal initialisation (device, kernels from the OS shader cache, mapping the weights); the first run on a machine also compiles the kernels (~0.3 s) and is not shown. Cold first token for the GPU binaries includes paging the weights in through the GPU mapping. Decode on the GPU is bound by the matrix-vector kernels (75-107 GB/s against llama.cpp's ~115 GB/s on this chip). The CPU control binaries ran while other processes still loaded the machine (15-minute load average 15; their decode is 70-79 tok/s against 113-128 in entries 5-6), so compare the GPU columns with the earlier entries rather than with the control rows of this one.",
+  "binaries": [
+    {
+      "name": "tinyllama_q4km",
+      "path": "/Users/pierreneter/WD/workplace--pierreneter/oss/aot-llm/out/tinyllama_cpu_sys",
+      "binary_mib": 645.4,
+      "threads": 8,
+      "kernels": "neon+dotprod",
+      "cold": {
+        "startup_ms": 7.201,
+        "first_token_ms": 646.0,
+        "prompt_tokens": 13,
+        "prompt_tps": 20.1,
+        "gen_tps": 53.9,
+        "peak_rss_mib": 644
+      },
+      "warm": {
+        "startup_ms": 0.411,
+        "first_token_ms": 127.8,
+        "prompt_tokens": 13,
+        "prompt_tps": 101.8,
+        "gen_tps": 69.6,
+        "gen_tps_min": 64.5,
+        "gen_tps_max": 81.4,
+        "peak_rss_mib": 644
+      },
+      "chat": {
+        "prompt_tokens": 88,
+        "prompt_cached": 66,
+        "first_token_ms": 189.1,
+        "first_token_ms_min": 151.3,
+        "prompt_tps": 116.4,
+        "prompt_tps_max": 145.4
+      },
+      "sample_output": "it is a funny story.\n\n2. The Tale of the Three Little Pigs:\n\nThe Tale of the Three Little Pigs is a classic fairy tale t"
+    },
+    {
+      "name": "tinyllama_q4km_metal",
+      "path": "/Users/pierreneter/WD/workplace--pierreneter/oss/aot-llm/out/tinyllama_gpu_sys",
+      "binary_mib": 645.4,
+      "threads": 8,
+      "kernels": "metal (Apple M1 Pro)",
+      "cold": {
+        "startup_ms": 836.588,
+        "first_token_ms": 109.0,
+        "prompt_tokens": 13,
+        "prompt_tps": 119.4,
+        "gen_tps": 108.6,
+        "peak_rss_mib": 656
+      },
+      "warm": {
+        "startup_ms": 30.083,
+        "first_token_ms": 68.7,
+        "prompt_tokens": 13,
+        "prompt_tps": 190.2,
+        "gen_tps": 105.9,
+        "gen_tps_min": 103.7,
+        "gen_tps_max": 109.1,
+        "peak_rss_mib": 655
+      },
+      "chat": {
+        "prompt_tokens": 88,
+        "prompt_cached": 66,
+        "first_token_ms": 64.5,
+        "first_token_ms_min": 63.9,
+        "prompt_tps": 341.5,
+        "prompt_tps_max": 344.6
+      },
+      "sample_output": "it is a funny story.\n\n2. The Gingerbread Man by Kate DiCamillo: The Gingerbread Man is a classic tale about a gingerbrea"
+    },
+    {
+      "name": "llama32_1b_q4km",
+      "path": "/Users/pierreneter/WD/workplace--pierreneter/oss/aot-llm/out/llama32_cpu_sys",
+      "binary_mib": 779.9,
+      "threads": 8,
+      "kernels": "neon+dotprod",
+      "cold": {
+        "startup_ms": 21.136,
+        "first_token_ms": 743.7,
+        "prompt_tokens": 11,
+        "prompt_tps": 14.8,
+        "gen_tps": 77.8,
+        "peak_rss_mib": 773
+      },
+      "warm": {
+        "startup_ms": 0.697,
+        "first_token_ms": 88.7,
+        "prompt_tokens": 11,
+        "prompt_tps": 124.2,
+        "gen_tps": 79.3,
+        "gen_tps_min": 63.6,
+        "gen_tps_max": 82.1,
+        "peak_rss_mib": 773
+      },
+      "chat": {
+        "prompt_tokens": 70,
+        "prompt_cached": 55,
+        "first_token_ms": 110.1,
+        "first_token_ms_min": 98.1,
+        "prompt_tps": 136.5,
+        "prompt_tps_max": 153.1
+      },
+      "sample_output": "the fox is faster than the dog. This is a classic example of a lateral thinking puzzle, which requires the solver to thi"
+    },
+    {
+      "name": "llama32_1b_q4km_metal",
+      "path": "/Users/pierreneter/WD/workplace--pierreneter/oss/aot-llm/out/llama32_gpu_sys",
+      "binary_mib": 779.9,
+      "threads": 8,
+      "kernels": "metal (Apple M1 Pro)",
+      "cold": {
+        "startup_ms": 607.77,
+        "first_token_ms": 131.6,
+        "prompt_tokens": 11,
+        "prompt_tps": 83.7,
+        "gen_tps": 92.4,
+        "peak_rss_mib": 783
+      },
+      "warm": {
+        "startup_ms": 30.004,
+        "first_token_ms": 66.4,
+        "prompt_tokens": 11,
+        "prompt_tps": 166.0,
+        "gen_tps": 92.2,
+        "gen_tps_min": 92.1,
+        "gen_tps_max": 92.3,
+        "peak_rss_mib": 783
+      },
+      "chat": {
+        "prompt_tokens": 70,
+        "prompt_cached": 55,
+        "first_token_ms": 73.9,
+        "first_token_ms_min": 65.0,
+        "prompt_tps": 203.8,
+        "prompt_tps_max": 231.6
+      },
+      "sample_output": "the fox is faster than the dog. The fox is brown, the dog is lazy, and the fox jumps over the dog. The fox is brown, the"
+    }
+  ]
+}

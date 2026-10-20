@@ -1,6 +1,125 @@
 //! Model dimensions, tensor descriptors and the per-run activation state.
 
 use super::quant::{BlockQ8_0, BlockQ8_K, Kind};
+use std::ops::{Deref, DerefMut};
+
+/// Page size assumed for page-aligned buffers (16 KiB covers Apple Silicon;
+/// 4 KiB systems only waste a little padding).
+pub const PAGE: usize = 16384;
+
+/// Page-aligned, zero-initialised buffer of plain numbers.
+///
+/// Activation buffers and the KV cache live in these instead of `Vec`s so a
+/// GPU backend can map them without copying (Metal's
+/// `newBufferWithBytesNoCopy` needs page-aligned memory of a page-multiple
+/// length) while the CPU kernels keep using them as ordinary slices. The
+/// memory comes straight from `mmap`, so large buffers are zero-filled
+/// lazily by the kernel, exactly like a `vec![0.0; n]` from the allocator.
+pub struct Buf<T> {
+    ptr: *mut T,
+    len: usize,
+    /// Bytes actually mapped (rounded up to whole pages); 0 when empty.
+    bytes: usize,
+}
+
+// SAFETY: the buffer owns its mapping; access is through ordinary slices.
+unsafe impl<T: Send> Send for Buf<T> {}
+unsafe impl<T: Sync> Sync for Buf<T> {}
+
+impl<T> Buf<T> {
+    /// Allocate `len` zeroed elements. `T` must be a plain number type for
+    /// which the all-zero bit pattern is a valid value.
+    pub fn zeroed(len: usize) -> Buf<T> {
+        let bytes = (len * std::mem::size_of::<T>()).div_ceil(PAGE) * PAGE;
+        if bytes == 0 {
+            return Buf { ptr: std::ptr::NonNull::dangling().as_ptr(), len, bytes: 0 };
+        }
+        #[cfg(unix)]
+        {
+            const PROT_READ: i32 = 1;
+            const PROT_WRITE: i32 = 2;
+            const MAP_PRIVATE: i32 = 2;
+            #[cfg(target_os = "linux")]
+            const MAP_ANON: i32 = 0x20;
+            #[cfg(not(target_os = "linux"))]
+            const MAP_ANON: i32 = 0x1000;
+            extern "C" {
+                fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
+            }
+            // SAFETY: anonymous private mapping; the kernel returns zeroed,
+            // page-aligned memory or MAP_FAILED.
+            let p = unsafe { mmap(std::ptr::null_mut(), bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0) };
+            assert!(p as usize != usize::MAX, "mmap of {bytes} bytes failed: {}", std::io::Error::last_os_error());
+            Buf { ptr: p as *mut T, len, bytes }
+        }
+        #[cfg(not(unix))]
+        {
+            let layout = std::alloc::Layout::from_size_align(bytes, PAGE).unwrap();
+            // SAFETY: non-zero size; zeroed allocation.
+            let p = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!p.is_null(), "allocation of {bytes} bytes failed");
+            Buf { ptr: p as *mut T, len, bytes }
+        }
+    }
+
+    /// Bytes mapped for this buffer (a multiple of [`PAGE`]).
+    pub fn byte_len(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl<T> Deref for Buf<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        // SAFETY: `len` elements were allocated and zero-initialised.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl<T> DerefMut for Buf<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: as above; `&mut self` guarantees exclusive access.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Buf<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut Buf<T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl<T> Drop for Buf<T> {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            extern "C" {
+                fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
+            }
+            // SAFETY: unmapping exactly what `zeroed` mapped.
+            unsafe { munmap(self.ptr as *mut _, self.bytes) };
+        }
+        #[cfg(not(unix))]
+        {
+            let layout = std::alloc::Layout::from_size_align(self.bytes, PAGE).unwrap();
+            // SAFETY: allocated with the same layout in `zeroed`.
+            unsafe { std::alloc::dealloc(self.ptr as *mut u8, layout) };
+        }
+    }
+}
 
 /// Architecture hyper-parameters of a Llama-family model.
 #[derive(Debug, Clone, Copy)]
@@ -119,25 +238,28 @@ impl Weights {
 }
 
 /// Activation buffers and KV cache for one sequence.
+///
+/// The float buffers are page-aligned [`Buf`]s so a GPU backend can share them
+/// with the CPU path without copies (see `metal.rs`).
 pub struct State {
     pub ctx: usize,
     /// Residual stream.
-    pub x: Vec<f32>,
+    pub x: Buf<f32>,
     /// Normalised input to attention / FFN.
-    pub xb: Vec<f32>,
+    pub xb: Buf<f32>,
     /// Output of attention / FFN before the residual add.
-    pub xb2: Vec<f32>,
-    pub q: Vec<f32>,
-    pub k: Vec<f32>,
-    pub v: Vec<f32>,
-    pub hb: Vec<f32>,
-    pub hb2: Vec<f32>,
-    pub logits: Vec<f32>,
+    pub xb2: Buf<f32>,
+    pub q: Buf<f32>,
+    pub k: Buf<f32>,
+    pub v: Buf<f32>,
+    pub hb: Buf<f32>,
+    pub hb2: Buf<f32>,
+    pub logits: Buf<f32>,
     /// Attention scores scratch, `n_head * ctx`.
-    pub scores: Vec<f32>,
+    pub scores: Buf<f32>,
     /// `n_layer * ctx * kv_dim`.
-    pub k_cache: Vec<f32>,
-    pub v_cache: Vec<f32>,
+    pub k_cache: Buf<f32>,
+    pub v_cache: Buf<f32>,
     /// Quantized activations (Q8_0 blocks) for Q4_0 / Q8_0 weights.
     pub aq0: Vec<BlockQ8_0>,
     /// Quantized activations (Q8_K blocks) for K-quant weights.
@@ -145,19 +267,19 @@ pub struct State {
     /// Per-dimension inverse RoPE frequencies, `rot_dim / 2`.
     pub inv_freq: Vec<f32>,
     /// Interleaved (cos, sin) for the current position, `rot_dim`.
-    pub rope_cs: Vec<f32>,
+    pub rope_cs: Buf<f32>,
     /// Largest number of prompt tokens processed in one batched step.
     pub max_batch: usize,
     /// Batched activations (`max_batch` rows each); empty when `max_batch == 1`.
-    pub bx: Vec<f32>,
-    pub bxb: Vec<f32>,
-    pub bxb2: Vec<f32>,
-    pub bq: Vec<f32>,
-    pub bk: Vec<f32>,
-    pub bv: Vec<f32>,
-    pub bhb: Vec<f32>,
-    pub bhb2: Vec<f32>,
-    pub brope_cs: Vec<f32>,
+    pub bx: Buf<f32>,
+    pub bxb: Buf<f32>,
+    pub bxb2: Buf<f32>,
+    pub bq: Buf<f32>,
+    pub bk: Buf<f32>,
+    pub bv: Buf<f32>,
+    pub bhb: Buf<f32>,
+    pub bhb2: Buf<f32>,
+    pub brope_cs: Buf<f32>,
     pub baq0: Vec<BlockQ8_0>,
     pub baqk: Vec<BlockQ8_K>,
 }
@@ -180,32 +302,32 @@ impl State {
         }
         State {
             ctx,
-            x: vec![0.0; d.dim],
-            xb: vec![0.0; d.dim],
-            xb2: vec![0.0; d.dim],
-            q: vec![0.0; d.q_dim()],
-            k: vec![0.0; d.kv_dim()],
-            v: vec![0.0; d.kv_dim()],
-            hb: vec![0.0; d.hidden],
-            hb2: vec![0.0; d.hidden],
-            logits: vec![0.0; d.vocab],
-            scores: vec![0.0; d.n_head.max(n_threads) * ctx],
-            k_cache: vec![0.0; d.n_layer * ctx * d.kv_dim()],
-            v_cache: vec![0.0; d.n_layer * ctx * d.kv_dim()],
+            x: Buf::zeroed(d.dim),
+            xb: Buf::zeroed(d.dim),
+            xb2: Buf::zeroed(d.dim),
+            q: Buf::zeroed(d.q_dim()),
+            k: Buf::zeroed(d.kv_dim()),
+            v: Buf::zeroed(d.kv_dim()),
+            hb: Buf::zeroed(d.hidden),
+            hb2: Buf::zeroed(d.hidden),
+            logits: Buf::zeroed(d.vocab),
+            scores: Buf::zeroed(d.n_head.max(n_threads) * ctx),
+            k_cache: Buf::zeroed(d.n_layer * ctx * d.kv_dim()),
+            v_cache: Buf::zeroed(d.n_layer * ctx * d.kv_dim()),
             aq0: Vec::new(),
             aqk: Vec::new(),
             inv_freq,
-            rope_cs: vec![0.0; d.rot_dim],
+            rope_cs: Buf::zeroed(d.rot_dim),
             max_batch,
-            bx: vec![0.0; b * d.dim],
-            bxb: vec![0.0; b * d.dim],
-            bxb2: vec![0.0; b * d.dim],
-            bq: vec![0.0; b * d.q_dim()],
-            bk: vec![0.0; b * d.kv_dim()],
-            bv: vec![0.0; b * d.kv_dim()],
-            bhb: vec![0.0; b * d.hidden],
-            bhb2: vec![0.0; b * d.hidden],
-            brope_cs: vec![0.0; b * d.rot_dim],
+            bx: Buf::zeroed(b * d.dim),
+            bxb: Buf::zeroed(b * d.dim),
+            bxb2: Buf::zeroed(b * d.dim),
+            bq: Buf::zeroed(b * d.q_dim()),
+            bk: Buf::zeroed(b * d.kv_dim()),
+            bv: Buf::zeroed(b * d.kv_dim()),
+            bhb: Buf::zeroed(b * d.hidden),
+            bhb2: Buf::zeroed(b * d.hidden),
+            brope_cs: Buf::zeroed(b * d.rot_dim),
             baq0: Vec::new(),
             baqk: Vec::new(),
         }

@@ -27,18 +27,19 @@ aot-llm is about **first-response latency and packaging**, not raw throughput. S
 | | aot-llm | Ollama / llama.cpp |
 |---|---|---|
 | process start → ready to decode | **0.2–0.8 ms** | 0.5–2.8 s model load, and the server must already be running |
-| chat reply with a fixed system prompt, first token (warm) | **90–160 ms** (baked KV prefix) | ~500–780 ms per request (CPU), ~470 ms (Metal) |
+| chat reply with a fixed system prompt, first token (warm) | **90–160 ms** (baked KV prefix, CPU), **64–74 ms** (Metal) | ~500–780 ms per request (CPU), ~470 ms (Metal) |
 | cold first token (nothing in the page cache) | 0.6–0.7 s | 1.3–4.6 s |
 | resident memory | 614–773 MiB | 766–1586 MiB plus ~40 MiB of server/app |
 | decode, CPU | **113–128 tok/s** | 86–117 tok/s |
-| decode, GPU | none | 139–150 tok/s (Metal) |
-| long prompt evaluation | 200–260 tok/s | 410–510 tok/s |
+| decode, GPU (`--gpu metal`) | 92–106 tok/s | 139–150 tok/s (Metal) |
+| long prompt evaluation | 200–260 tok/s (CPU), **550–750 tok/s** (Metal) | 410–510 tok/s |
+| process start → ready, GPU | ~25–30 ms (Metal device, kernels from the OS cache, weights mapped) | 0.5–0.8 s model load |
 | deployment | one file, no runtime, no daemon; copy and run; static Linux cross-build | install Ollama, pull the model, keep a server up |
 | models | `llama` architecture, 8 tensor types | every architecture and quantization |
 
 **Good fit:** command-line tools, agents that call a model many times for short answers, edge / serverless / cron jobs where a process spawns, answers and exits, embedding a model in an application.
 
-**Poor fit:** multi-user chat servers, very long prompts (RAG, documents), anything that needs a GPU. vLLM and friends solve a different problem (batched GPU serving, cold starts of tens of seconds) and are not comparable for one process answering one request.
+**Poor fit:** multi-user chat servers, very long prompts (RAG, documents) on the CPU, machines whose GPU is not an Apple one (only Metal is supported). vLLM and friends solve a different problem (batched GPU serving, cold starts of tens of seconds) and are not comparable for one process answering one request.
 
 ## What it does
 
@@ -50,6 +51,7 @@ aot-llm is about **first-response latency and packaging**, not raw throughput. S
 * **Compile-time KV prefix cache.** `aot-llm compile --system "..."` evaluates the system prompt at build time and embeds its key/value cache in the binary; a chat prompt with that system prompt skips straight to the user turn.
 * **Background prefault.** At startup worker threads page the weights in (`madvise` + page touch) while the main thread tokenizes, which shortens cold first-token latency. `--no-prefetch` turns it off.
 * **Single-binary output.** `aot-llm compile` writes a standalone Cargo project and builds it; cross-compiling to `x86_64-unknown-linux-musl` from macOS produces a static ELF.
+* **Optional Metal backend.** `aot-llm compile --gpu metal` adds a GPU path for Apple Silicon. The weights section of the executable is handed to Metal without a copy (unified memory), the activation buffers and the KV cache are shared between CPU and GPU, and a decode step is one command buffer of eight kernel dispatches per layer (RoPE, the SwiGLU product and the residual adds are fused into the quantized matrix-vector kernels). Prompt batches run as a simdgroup-matrix GEMM. The frameworks are loaded with `dlopen`, so the binary still links only `libSystem`, runs on the CPU with `--device cpu` and falls back to it when no GPU is available. The kernels are embedded as source and compiled by the system once per machine (cached afterwards).
 
 ## Quick start
 
@@ -68,6 +70,10 @@ cargo build --release
 # Optional: bake the KV cache of a fixed system prompt into the binary (two build passes)
 ./target/release/aot-llm compile --model ./Llama-3.2-1B-Instruct-Q4_K_M.gguf --output ./llama32 \
     --system "You are a concise assistant. Answer in one short paragraph."
+
+# Optional: also compile the Metal GPU path (macOS, Apple Silicon); the binary then uses the GPU by default
+./target/release/aot-llm compile --model ./Llama-3.2-1B-Instruct-Q4_K_M.gguf --output ./llama32_gpu --gpu metal
+./llama32_gpu --prompt "The capital of France is" -n 32              # --device cpu switches back
 
 # Run
 ./llama32 --prompt "The capital of France is" -n 32
@@ -95,6 +101,7 @@ Generated binary options:
     --no-prefetch        Do not page in the weights from background threads at startup
     --no-prefix-cache    Ignore the compile-time KV prefix cache
     --kernels NAME       auto | scalar | neon | neon-dotprod | avx2
+    --device NAME        auto | cpu | gpu (gpu needs a binary built with --gpu) [default: auto]
     --weights PATH       Sidecar weights file (sidecar builds only)
     --show-special       Print special tokens
     --tokens             Print token ids instead of text
@@ -103,7 +110,7 @@ Generated binary options:
     --info               Print model information and exit
 ```
 
-Compiler options (`aot-llm compile --help`): `--system TEXT` / `--prefix TEXT` (bake a KV prefix cache), `--target <triple>`, `--native` (`-C target-cpu=native`), `--sidecar`, `--emit-only` (generate the project without building), `--build-dir`, `--name`, `-j`, `-q`.
+Compiler options (`aot-llm compile --help`): `--gpu metal` (compile the Metal backend in, macOS only), `--system TEXT` / `--prefix TEXT` (bake a KV prefix cache), `--target <triple>`, `--native` (`-C target-cpu=native`), `--sidecar`, `--emit-only` (generate the project without building), `--build-dir`, `--name`, `-j`, `-q`.
 
 Debugging: `AOT_DEBUG_COMPARE=1 ./bin ...` re-evaluates the prompt token by token and reports the first KV-cache divergence from the batched path; `--dump-logits` prints the logits of the last prompt token.
 
@@ -148,6 +155,17 @@ tokens -> embedding -> [RMSNorm -> Attention(GQA, RoPE, KV cache) -> + -> RMSNor
 
 Per matmul, the f32 activation vector is quantized once to Q8_0 (for Q4_0/Q8_0 weights) or Q8_K (for K-quants) and every output row is an integer dot product scaled back to f32, the same scheme ggml uses, so results match llama.cpp. During decoding the q/k/v projections form one parallel region and gate/up another; rows are handed out in dynamic chunks; attention is parallel over heads. The thread pool keeps workers hot between the few hundred small parallel regions of a decode step.
 
+### The Metal path
+
+With `--gpu metal` the generated `model.rs` also contains `forward_gpu` / `forward_batch_gpu`, which encode the same operator sequence into one Metal command buffer per step through `rt/metal.rs`:
+
+* The weights section is placed in `__DATA` (page aligned) and re-mapped `MAP_SHARED` from the executable file at startup, then wrapped with `newBufferWithBytesNoCopy`. A private mapping would be copied page by page the first time the GPU wires it (hundreds of milliseconds), and wired copies of `__TEXT` pages make the CPU fault on them afterwards; the shared mapping has neither problem and shares the page cache with the loader's own mapping. Mapping 636 MB costs about 15–25 ms on first use.
+* The activation buffers and the KV cache of `State` are page-aligned anonymous mappings wrapped the same way, so the CPU embedding lookup, the GPU transformer blocks, the compile-time KV prefix and the sampler all work on one copy of the data.
+* A decode step is eight dispatches per layer: RMSNorm, the `q`, `k`, `v` projections (RoPE applied in the epilogue of `q` and `k`, `k` and `v` written straight into the cache), attention (one threadgroup per head, online softmax over blocks of 32 positions), `wo` (residual add fused), RMSNorm, the fused `gate`/`up`/SwiGLU product and `down` (residual add fused). The matrix-vector kernels are bound by their vector loads, so RMSNorm is kept as its own 12 µs kernel: folding it into the products (a second vector read per simdgroup) measured 2–3x slower. Prompt batches use a 32x32x32-tile GEMM on the simdgroup matrix units with the weights dequantized once per tile.
+* The Objective-C runtime and `Metal.framework` are resolved with `dlopen`/`dlsym` on first use; nothing is linked, and `--device cpu` never loads them. The kernel source (`shaders.metal`) is embedded and compiled by the system Metal compiler the first time a binary runs on a machine (~0.3 s), then served from the OS shader cache (<1 ms).
+
+The GPU kernels use f32 activations and dequantize weights on the fly (as ggml's Metal path does) instead of the CPU path's Q8 activations, so GPU output is not bit-identical to the CPU path or to llama.cpp's CPU output; it is closer to exact f32 arithmetic (kernel error ~1e-6 relative against an f64 reference versus ~1e-3 for the Q8 path), and greedy generations agree in practice.
+
 Prompt tokens are processed by `forward_batch` in chunks: every weight row is loaded once per chunk and the 1x4 micro-kernels decode each quantized block once for four activations, so prompt evaluation runs several times faster than decoding. With `--system`, the compiler builds the binary twice: pass 1 evaluates the system prefix with the final kernels and writes its KV cache, pass 2 embeds that blob in a read-only section; at run time a prompt whose tokens start with the baked prefix loads the rows with a memcpy and evaluates only the user turn.
 
 ### Repository layout
@@ -155,7 +173,7 @@ Prompt tokens are processed by `forward_batch` in chunks: every weight row is lo
 | crate                | role                                                                                                                                                                                |
 |----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `crates/aot-gguf`    | GGUF v2/v3 parser (header, metadata, tensor descriptors), memory-mapped access, in-memory writer for tests                                                                          |
-| `crates/aot-kernels` | the runtime: quant layouts, SIMD matvec kernels, RMSNorm / RoPE / attention, thread pool, tokenizer, sampler, CLI driver. Copied verbatim into every generated project as `src/rt/` |
+| `crates/aot-kernels` | the runtime: quant layouts, SIMD matvec kernels, RMSNorm / RoPE / attention, thread pool, tokenizer, sampler, CLI driver, Metal backend (`metal.rs`, `shaders.metal`). Copied verbatim into every generated project as `src/rt/` |
 | `crates/aot-codegen` | graph extraction (`ModelSpec`), tokenizer blob builder, Rust project emitter, cargo driver                                                                                          |
 | `crates/aot-llm`     | the `aot-llm` CLI: `compile`, `inspect`, `tokenize`                                                                                                                                 |
 
@@ -170,8 +188,9 @@ The tables below are the initial measurements of the first release. Every later 
 | + background prefault | 375 ms (cold first token 652 → 642 ms) | 302 ms (1030 → 711 ms) | 114 tok/s | 93 tok/s |
 | + fused q/k/v, dynamic chunks, `fcvt` scales | 436 ms | 298 ms | **128 tok/s** | **113 tok/s** |
 | + baked system-prompt KV cache (`--system`) | **164 ms** | **90 ms** | 128 tok/s | 113 tok/s |
+| Metal backend (`--gpu metal`), same prompts on the GPU | **64 ms** (+30 ms Metal start-up) | **74 ms** (+30 ms) | 106 tok/s | 92 tok/s |
 
-Decode is now at llama.cpp's CPU speed (117 / 86 tok/s in Ollama), and a chat reply with a baked system prompt starts in about 100 ms instead of 700–1000 ms. The baseline tables that follow are kept for reference.
+Decode is now at llama.cpp's CPU speed (117 / 86 tok/s in Ollama), and a chat reply with a baked system prompt starts in about 100 ms instead of 700–1000 ms. The Metal path trades ~30 ms of start-up (loading the frameworks, creating the device, kernels from the OS shader cache, wiring the weights) for prompt evaluation at 550–750 tok/s on 300-token prompts (CPU: 200–260), chat first tokens of 64–74 ms and decoding at 92–106 tok/s on these 1B models, slightly below the CPU path on TinyLlama and a little above it on Llama 3.2 (the GPU kernels reach 75–107 GB/s against llama.cpp's ~115 GB/s). It is the better choice for long prompts and for models the CPU cannot keep up with; details in [`docs/benchmarks/07-metal.md`](docs/benchmarks/07-metal.md). The baseline tables that follow are kept for reference.
 
 Machine: Apple M1 Pro (8 performance + 2 efficiency cores, 16 GB), macOS, Rust 1.99. Prompt: 11-13 tokens, 64 generated tokens, greedy, warm page cache, 8 threads, median of 3 runs on an otherwise idle machine. Ollama 0.34.4 with its bundled llama.cpp `llama-server`, same GGUF files imported with `ollama create`, measured through `/api/generate` (`raw: true`); "cold" means after `ollama stop`.
 
@@ -218,8 +237,9 @@ Decode speed is within ~10% of llama.cpp's CPU path. Prompt evaluation is the kn
 * `cargo test --workspace` runs
   * unit tests for the GGUF parser, f16 conversion, quantizers, pool, ops, sampler and tokenizer pre-tokenizers;
   * `crates/aot-kernels/tests/dots.rs`: every SIMD dot product (NEON, NEON+dotprod, AVX2, AVX2+F16C) against the scalar reference and a float reference, for every supported weight type;
+  * `crates/aot-kernels/tests/metal.rs` (macOS): every Metal kernel against the CPU operators: the matrix product for all eight weight formats (single vector, batched, partial tiles, residual accumulation), the fused RoPE / gate / RMSNorm variants, RMSNorm, RoPE, attention for 64- and 128-wide heads, SwiGLU; skipped when no Metal device exists;
   * `crates/aot-codegen/tests/tokenizer_blob.rs`: SentencePiece and byte-level BPE round trips through the serialised blob;
-  * `crates/aot-llm/tests/e2e.rs`: builds a tiny random Llama GGUF that uses all eight weight types, compiles it with the CLI, runs the binary with `--dump-logits` and compares against an f32 reference forward pass (max error 0.0000 on the logits).
+  * `crates/aot-llm/tests/e2e.rs`: builds a tiny random Llama GGUF that uses all eight weight types, compiles it with the CLI, runs the binary with `--dump-logits` and compares against an f32 reference forward pass (max error 0.0000 on the logits); on macOS it also compiles the model with `--gpu metal` and checks the GPU logits (single-token and batched prompt paths) against the unquantized reference.
 * Tokenization was checked against llama.cpp ids for both vocabularies (e.g. Llama 3 `"Hello world"` -> `[128000, 9906, 1917]`, TinyLlama -> `[1, 15043, 3186]`).
 * Greedy generations of both real models match Ollama/llama.cpp token for token.
 * The AVX2 kernels were validated by running the test suite under `docker run --platform linux/amd64`; a TinyLlama binary cross-compiled to `x86_64-unknown-linux-musl` runs in the same container (`avx2+f16c`).
@@ -239,10 +259,10 @@ For `*-musl` targets the generated project links with `rust-lld` and the self-co
 * Architecture `llama` as written by `convert_hf_to_gguf.py`: Llama 1/2/3/3.1/3.2, TinyLlama, Mistral 7B, Vicuna, OpenLLaMA and other derivatives without biases. RoPE "normal" layout, grouped-query attention, RMSNorm, SwiGLU, tied or separate output head, Llama 3.x RoPE frequency factors, linear RoPE scaling.
 * Tensor types: `f32`, `f16`, `bf16`, `q4_0`, `q8_0`, `q4_K`, `q5_K`, `q6_K` (covers `Q4_0`, `Q8_0`, `Q4_K_S/M`, `Q5_K_S/M`, `Q6_K`, `F16` files). `iq*`, `q2_K`, `q3_K`, `q4_1`, `q5_0/1` are rejected with a message naming the tensor.
 * Tokenizers: SentencePiece (`llama`) and byte-level BPE (`gpt2` with the Llama 3 or GPT-2 pre-tokenizer).
-* Single sequence, batch size 1, CPU only, unix targets (the weight embedding uses `global_asm!`, memory mapping uses `mmap`).
-* Not yet: batched prompt processing, KV-cache quantization, other architectures (Qwen2, Gemma, Phi), GPU.
+* Single sequence, batch size 1, unix targets (the weight embedding uses `global_asm!`, memory mapping uses `mmap`). GPU: Metal on macOS / Apple Silicon only (`--gpu metal`), head sizes of 32, 64, 96 or 128.
+* Not yet: KV-cache quantization, other architectures (Qwen2, Gemma, Phi), CUDA / Vulkan backends.
 
-`unsafe` is confined to SIMD intrinsics, the `.incbin` symbol and `mmap` views, and the fork-join pool's lifetime-erased job pointer and disjoint-range writes; each site is commented with its invariant.
+`unsafe` is confined to SIMD intrinsics, the `.incbin` symbol and `mmap` views, the fork-join pool's lifetime-erased job pointer and disjoint-range writes, and the Metal backend's `objc_msgSend` calls; each site is commented with its invariant.
 
 ## License
 

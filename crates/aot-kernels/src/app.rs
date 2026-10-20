@@ -18,11 +18,24 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
+pub use super::metal::Gpu;
+/// Placeholder on platforms without a GPU backend (`Runtime::forward_gpu`
+/// is always `None` there, so this is never constructed).
+#[cfg(not(target_os = "macos"))]
+pub struct Gpu {
+    pub name: String,
+    pub init_ms: f64,
+}
+
 /// Static forward pass: `(state, weights, pool, token, position, want_logits)`.
 pub type ForwardFn = fn(&mut State, &Weights, &Pool, u32, usize, bool);
 /// Batched forward pass over consecutive prompt tokens:
 /// `(state, weights, pool, tokens, first_position, want_logits)`.
 pub type ForwardBatchFn = fn(&mut State, &Weights, &Pool, &[u32], usize, bool);
+/// GPU variants of the two (binaries built with `--gpu`).
+pub type ForwardGpuFn = fn(&mut State, &Weights, &mut Gpu, u32, usize, bool);
+pub type ForwardBatchGpuFn = fn(&mut State, &Weights, &mut Gpu, &[u32], usize, bool);
 
 /// Default number of prompt tokens per batched step.
 pub const DEFAULT_BATCH: usize = 64;
@@ -33,6 +46,9 @@ pub struct Runtime {
     pub info: &'static ModelInfo,
     pub forward: ForwardFn,
     pub forward_batch: ForwardBatchFn,
+    /// GPU forward passes; `None` when the binary was built without `--gpu`.
+    pub forward_gpu: Option<ForwardGpuFn>,
+    pub forward_batch_gpu: Option<ForwardBatchGpuFn>,
     /// Optional per-dimension RoPE frequency factors (Llama 3.x scaling).
     pub rope_freqs: Option<Tensor>,
     pub tokenizer_blob: &'static [u8],
@@ -57,6 +73,7 @@ struct Args {
     no_bos: bool,
     no_prefetch: bool,
     kernels: Option<String>,
+    device: Option<String>,
     weights_path: Option<PathBuf>,
     quiet: bool,
     info: bool,
@@ -86,6 +103,7 @@ Options:
       --no-bos             Do not prepend the BOS token
       --no-prefetch        Do not page in the weights from background threads at startup
       --kernels NAME       auto|scalar|neon|neon-dotprod|avx2
+      --device NAME        auto|cpu|gpu (gpu needs a binary built with --gpu) [default: auto]
       --weights PATH       Sidecar weights file (sidecar builds only)
       --show-special       Print special tokens
       --tokens             Print token ids instead of text
@@ -110,6 +128,7 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
         no_bos: false,
         no_prefetch: false,
         kernels: None,
+        device: None,
         weights_path: None,
         quiet: false,
         info: false,
@@ -144,6 +163,7 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
             "--no-prefetch" => a.no_prefetch = true,
             "--prefetch" => {}
             "--kernels" => a.kernels = Some(next(&mut i, f)?),
+            "--device" => a.device = Some(next(&mut i, f)?),
             "--weights" => a.weights_path = Some(PathBuf::from(next(&mut i, f)?)),
             "--show-special" => a.show_special = true,
             "--tokens" => a.tokens_only = true,
@@ -204,6 +224,7 @@ fn print_info(rt: &Runtime) {
         );
     }
     let _ = writeln!(o, "kernels:      {} ({} cores)", matvec::detect_kernels().name, default_threads());
+    let _ = writeln!(o, "gpu:          {}", if rt.forward_gpu.is_some() { "metal (--device auto|cpu|gpu)" } else { "none (compile with --gpu metal)" });
     let _ = writeln!(o, "compiler:     aot-llm {}", rt.info.compiler_version);
 }
 
@@ -222,6 +243,34 @@ fn flush_utf8(buf: &mut Vec<u8>, out: &mut impl Write) {
     // Drop hopeless garbage (a partial sequence longer than 4 bytes).
     if buf.len() > 4 {
         buf.clear();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gpu_new(weights: &'static [u8], state: &State, d: &Dims) -> Result<Gpu, String> {
+    Gpu::new(weights, state, d)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn gpu_new(_weights: &'static [u8], _state: &State, _d: &Dims) -> Result<Gpu, String> {
+    Err("no GPU backend on this platform".into())
+}
+
+/// One forward step on whichever device is active.
+#[allow(clippy::too_many_arguments)]
+fn step(rt: &Runtime, state: &mut State, weights: &Weights, pool: &Pool, gpu: &mut Option<Gpu>, token: u32, pos: usize, want_logits: bool) {
+    match gpu {
+        Some(g) => (rt.forward_gpu.expect("gpu forward"))(state, weights, g, token, pos, want_logits),
+        None => (rt.forward)(state, weights, pool, token, pos, want_logits),
+    }
+}
+
+/// One batched prompt step on whichever device is active.
+#[allow(clippy::too_many_arguments)]
+fn step_batch(rt: &Runtime, state: &mut State, weights: &Weights, pool: &Pool, gpu: &mut Option<Gpu>, tokens: &[u32], pos0: usize, want_logits: bool) {
+    match gpu {
+        Some(g) => (rt.forward_batch_gpu.expect("gpu batched forward"))(state, weights, g, tokens, pos0, want_logits),
+        None => (rt.forward_batch)(state, weights, pool, tokens, pos0, want_logits),
     }
 }
 
@@ -275,6 +324,22 @@ pub fn main(rt: Runtime) -> i32 {
             }
         }
     }
+    let device = args.device.as_deref().unwrap_or("auto");
+    let use_gpu = match device {
+        "auto" => rt.forward_gpu.is_some(),
+        "gpu" | "metal" => {
+            if rt.forward_gpu.is_none() {
+                eprintln!("error: this binary was built without GPU support (aot-llm compile --gpu metal)");
+                return 2;
+            }
+            true
+        }
+        "cpu" => false,
+        other => {
+            eprintln!("error: unknown device {other} (auto | cpu | gpu)");
+            return 2;
+        }
+    };
     let t_pool0 = Instant::now();
     let pool = Pool::new(threads);
     let t_pool = t_pool0.elapsed();
@@ -329,7 +394,25 @@ pub fn main(rt: Runtime) -> i32 {
     let rope_ff = rt.rope_freqs.as_ref().map(|t| weights.f32s(t));
     let batch = args.batch.min(prompt.len()).max(1);
     let mut state = State::new(d, ctx, rope_ff, threads, batch);
-    // The baked prefix must fit in the context together with the prompt.
+    // GPU: maps the weights and the state's buffers (no copies), compiles or
+    // loads the kernels. Falls back to the CPU unless --device gpu was given.
+    let t_gpu0 = Instant::now();
+    let mut gpu: Option<Gpu> = None;
+    if use_gpu {
+        match gpu_new(wbytes, &state, d) {
+            Ok(g) => gpu = Some(g),
+            Err(e) if device == "auto" => {
+                if !args.quiet {
+                    eprintln!("warning: GPU unavailable ({e}); using the CPU");
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        }
+    }
+    let t_gpu = t_gpu0.elapsed();
     let t_ready = t0.elapsed();
 
     // Compile-time KV prefix: skip the tokens whose cache is embedded.
@@ -350,9 +433,9 @@ pub fn main(rt: Runtime) -> i32 {
         let end = (done + batch).min(prompt.len());
         let last = end == prompt.len();
         if end - done == 1 {
-            (rt.forward)(&mut state, &weights, &pool, prompt[done], done, last);
+            step(&rt, &mut state, &weights, &pool, &mut gpu, prompt[done], done, last);
         } else {
-            (rt.forward_batch)(&mut state, &weights, &pool, &prompt[done..end], done, last);
+            step_batch(&rt, &mut state, &weights, &pool, &mut gpu, &prompt[done..end], done, last);
         }
         done = end;
     }
@@ -368,7 +451,7 @@ pub fn main(rt: Runtime) -> i32 {
         return 0;
     }
 
-    if std::env::var_os("AOT_DEBUG_COMPARE").is_some() && batch > 1 {
+    if std::env::var_os("AOT_DEBUG_COMPARE").is_some() && batch > 1 && gpu.is_none() {
         // Debug aid: re-run the prompt token by token in a fresh state and
         // report the first (layer, position) where the KV caches diverge.
         let mut s2 = State::new(d, ctx, rope_ff, threads, 1);
@@ -436,7 +519,7 @@ pub fn main(rt: Runtime) -> i32 {
         if stop || generated >= args.max_tokens || pos >= ctx {
             break;
         }
-        (rt.forward)(&mut state, &weights, &pool, next, pos, true);
+        step(&rt, &mut state, &weights, &pool, &mut gpu, next, pos, true);
         pos += 1;
     }
     let t_gen = t2.elapsed();
@@ -452,10 +535,11 @@ pub fn main(rt: Runtime) -> i32 {
         let gen_forwards = generated.saturating_sub(1).max(if generated > 0 { 1 } else { 0 });
         let evaluated = prompt.len() - cached;
         let mut line = format!(
-            "[aot-llm] startup {:.3} ms (threads {:.3}, tokenize {:.3}) | prompt {} tok{} / {:.3} s ({:.1} tok/s) | gen {} tok / {:.3} s ({:.1} tok/s)",
+            "[aot-llm] startup {:.3} ms (threads {:.3}, tokenize {:.3}{}) | prompt {} tok{} / {:.3} s ({:.1} tok/s) | gen {} tok / {:.3} s ({:.1} tok/s)",
             t_ready.as_secs_f64() * 1e3,
             t_pool.as_secs_f64() * 1e3,
             t_encode.as_secs_f64() * 1e3,
+            if gpu.is_some() { format!(", gpu {:.3}", t_gpu.as_secs_f64() * 1e3) } else { String::new() },
             prompt.len(),
             if cached > 0 { format!(" ({cached} cached)") } else { String::new() },
             ps,
@@ -470,7 +554,11 @@ pub fn main(rt: Runtime) -> i32 {
         if let Some(rss) = weights::peak_rss_bytes() {
             line.push_str(&format!(" | peak RSS {:.0} MB", mb(rss)));
         }
-        line.push_str(&format!(" | {} threads | {} | ctx {}", threads, matvec::active_kernels().name, ctx));
+        let backend = match &gpu {
+            Some(g) => format!("metal ({})", g.name),
+            None => matvec::active_kernels().name.to_string(),
+        };
+        line.push_str(&format!(" | {} threads | {} | ctx {}", threads, backend, ctx));
         eprintln!("{line}");
     }
     0

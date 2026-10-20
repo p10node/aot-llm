@@ -26,6 +26,23 @@ pub struct EmitOptions {
     pub target: Option<String>,
     /// Absolute path of a baked KV prefix blob to embed (see `rt/prefix.rs`).
     pub prefix_kv_path: Option<PathBuf>,
+    /// GPU backend to compile in (the binary can still run on the CPU).
+    pub gpu: Option<GpuBackend>,
+}
+
+/// GPU backends the generated binary can use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuBackend {
+    /// Apple Metal (macOS only; see `rt/metal.rs`).
+    Metal,
+}
+
+impl GpuBackend {
+    pub fn name(self) -> &'static str {
+        match self {
+            GpuBackend::Metal => "metal",
+        }
+    }
 }
 
 /// Turn an arbitrary string into a valid crate name.
@@ -254,7 +271,12 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "use crate::rt::ops::*;").unwrap();
     writeln!(o, "use crate::rt::pool::Pool;").unwrap();
     writeln!(o, "use crate::rt::quant::*;").unwrap();
-    writeln!(o, "use crate::rt::state::*;\n").unwrap();
+    writeln!(o, "use crate::rt::state::*;").unwrap();
+    if opts.gpu.is_some() {
+        writeln!(o, "#[cfg(target_os = \"macos\")]").unwrap();
+        writeln!(o, "use crate::rt::metal::{{BufId, Gpu, MvOpts}};").unwrap();
+    }
+    writeln!(o).unwrap();
 
     writeln!(o, "pub const DIMS: Dims = Dims {{").unwrap();
     writeln!(o, "    dim: {},", d.dim).unwrap();
@@ -368,7 +390,120 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     emit_quantize(&mut o, "xb", [out_t.kind].into_iter());
     emit_matvec(&mut o, out_t, "OUTPUT", "logits", "xb");
     writeln!(o, "}}").unwrap();
+    if opts.gpu.is_some() {
+        emit_gpu_forwards(&mut o, spec);
+    }
     o
+}
+
+/// The GPU forward passes: the same operator sequence as the CPU ones,
+/// encoded into one Metal command buffer per step. Only the embedding lookup
+/// and the RoPE tables are computed on the CPU (they are tiny and the buffers
+/// are shared). The weight format of every matrix is fixed in the tensor
+/// table, so `Gpu::matmul` picks the kernel for it without any graph
+/// interpretation at run time.
+fn emit_gpu_forwards(o: &mut String, spec: &ModelSpec) {
+    let d = &spec.dims;
+    let (dim, hidden) = (d.dim, d.hidden);
+    let embd = spec.token_embd.kind.fn_suffix();
+    // Decoding: 8 dispatches per block. RoPE is applied in the epilogue of
+    // the q / k projections (k and v are written straight into the cache),
+    // the gate / up projections and the SwiGLU product are one kernel when
+    // both matrices share a format, and the residual adds are folded into
+    // the wo / down products. RMSNorm stays a separate (12 us) dispatch:
+    // folding it into the products was measured 2-3x slower.
+    let decode_block = |l: &LayerSpec| -> String {
+        let gate = if l.gate.kind == l.up.kind && l.gate.rows == l.up.rows {
+            "        g.gate_up_silu(BufId::Hb, &l.gate, &l.up, BufId::Xb);\n".to_string()
+        } else {
+            format!(
+                "        g.matmul(BufId::Hb, 0, &l.gate, BufId::Xb, 0, 1, false);
+        g.matmul(BufId::Hb2, 0, &l.up, BufId::Xb, 0, 1, false);
+        g.silu_mul(BufId::Hb, BufId::Hb2, {hidden});\n"
+            )
+        };
+        format!(
+            "        let kv_at = (i * s.ctx + pos) * kv;
+        g.rmsnorm(BufId::Xb, BufId::X, 0, &l.attn_norm, {dim}, 1, DIMS.eps);
+        g.mv(BufId::Q, 0, &l.wq, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::RopeCs), ..MvOpts::default() }});
+        g.mv(BufId::KCache, kv_at, &l.wk, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::RopeCs), ..MvOpts::default() }});
+        g.mv(BufId::VCache, kv_at, &l.wv, BufId::Xb, 0, None, MvOpts::default());
+        g.attention(BufId::Xb, BufId::Q, i, pos, 1, &DIMS, s.ctx);
+        g.mv(BufId::X, 0, &l.wo, BufId::Xb, 0, None, MvOpts {{ accumulate: true, ..MvOpts::default() }});
+        g.rmsnorm(BufId::Xb, BufId::X, 0, &l.ffn_norm, {dim}, 1, DIMS.eps);
+{gate}        g.mv(BufId::X, 0, &l.down, BufId::Hb, 0, None, MvOpts {{ accumulate: true, ..MvOpts::default() }});
+"
+        )
+    };
+    // Every layer has the same tensor layout, so the block body is identical
+    // unless a layer mixes gate / up formats; emit per-layer code only then.
+    let uniform = spec.layers.iter().all(|l| (l.gate.kind == l.up.kind && l.gate.rows == l.up.rows) == (spec.layers[0].gate.kind == spec.layers[0].up.kind && spec.layers[0].gate.rows == spec.layers[0].up.rows));
+    let decode_body = if uniform {
+        format!("    for (i, l) in LAYERS.iter().enumerate() {{\n{}    }}\n", decode_block(&spec.layers[0]))
+    } else {
+        let mut b = String::new();
+        for (i, l) in spec.layers.iter().enumerate() {
+            b.push_str(&format!("    {{\n        let (i, l) = ({i}, &LAYERS[{i}]);\n{}    }}\n", decode_block(l)));
+        }
+        b
+    };
+    // Prompt batches: the plain sequence (12 dispatches per block); the
+    // batched kernels are compute bound, so fusion matters less there.
+    let batch_body = format!(
+        "    for (i, l) in LAYERS.iter().enumerate() {{
+        let kv_at = (i * s.ctx + pos0) * kv;
+        g.rmsnorm(BufId::Bxb, BufId::Bx, 0, &l.attn_norm, {dim}, m, DIMS.eps);
+        g.matmul(BufId::Bq, 0, &l.wq, BufId::Bxb, 0, m, false);
+        g.matmul(BufId::KCache, kv_at, &l.wk, BufId::Bxb, 0, m, false);
+        g.matmul(BufId::VCache, kv_at, &l.wv, BufId::Bxb, 0, m, false);
+        g.rope(BufId::Bq, BufId::KCache, kv_at, m, BufId::BropeCs, &DIMS);
+        g.attention(BufId::Bxb, BufId::Bq, i, pos0, m, &DIMS, s.ctx);
+        g.matmul(BufId::Bx, 0, &l.wo, BufId::Bxb, 0, m, true);
+        g.rmsnorm(BufId::Bxb, BufId::Bx, 0, &l.ffn_norm, {dim}, m, DIMS.eps);
+        g.matmul(BufId::Bhb, 0, &l.gate, BufId::Bxb, 0, m, false);
+        g.matmul(BufId::Bhb2, 0, &l.up, BufId::Bxb, 0, m, false);
+        g.silu_mul(BufId::Bhb, BufId::Bhb2, m * {hidden});
+        g.matmul(BufId::Bx, 0, &l.down, BufId::Bhb, 0, m, true);
+    }}
+"
+    );
+    writeln!(o, "\n/// [`forward`] on the GPU: one command buffer for the whole step.").unwrap();
+    writeln!(o, "#[cfg(target_os = \"macos\")]").unwrap();
+    writeln!(o, "pub fn forward_gpu(s: &mut State, w: &Weights, g: &mut Gpu, token: u32, pos: usize, want_logits: bool) {{").unwrap();
+    writeln!(o, "    assert!((token as usize) < DIMS.vocab, \"token id out of range\");").unwrap();
+    writeln!(o, "    assert!(pos < s.ctx, \"position exceeds the context\");").unwrap();
+    writeln!(o, "    dequant_row_{embd}(w.row(&TOKEN_EMBD, token as usize), &mut s.x);").unwrap();
+    writeln!(o, "    rope_cos_sin(&mut s.rope_cs, &s.inv_freq, pos as f32 / DIMS.rope_scale);").unwrap();
+    writeln!(o, "    let kv = DIMS.kv_dim();").unwrap();
+    writeln!(o, "    g.begin();").unwrap();
+    o.push_str(&decode_body);
+    writeln!(o, "    if want_logits {{").unwrap();
+    writeln!(o, "        g.rmsnorm(BufId::Xb, BufId::X, 0, &OUTPUT_NORM, {dim}, 1, DIMS.eps);").unwrap();
+    writeln!(o, "        g.mv(BufId::Logits, 0, &OUTPUT, BufId::Xb, 0, None, MvOpts::default());").unwrap();
+    writeln!(o, "    }}").unwrap();
+    writeln!(o, "    g.finish();").unwrap();
+    writeln!(o, "}}\n").unwrap();
+
+    writeln!(o, "/// [`forward_batch`] on the GPU.").unwrap();
+    writeln!(o, "#[cfg(target_os = \"macos\")]").unwrap();
+    writeln!(o, "pub fn forward_batch_gpu(s: &mut State, w: &Weights, g: &mut Gpu, tokens: &[u32], pos0: usize, want_logits: bool) {{").unwrap();
+    writeln!(o, "    let m = tokens.len();").unwrap();
+    writeln!(o, "    assert!(m >= 1 && m <= s.max_batch, \"batch size out of range\");").unwrap();
+    writeln!(o, "    assert!(pos0 + m <= s.ctx, \"positions exceed the context\");").unwrap();
+    writeln!(o, "    for (i, &t) in tokens.iter().enumerate() {{").unwrap();
+    writeln!(o, "        assert!((t as usize) < DIMS.vocab, \"token id out of range\");").unwrap();
+    writeln!(o, "        dequant_row_{embd}(w.row(&TOKEN_EMBD, t as usize), &mut s.bx[i * {dim}..(i + 1) * {dim}]);").unwrap();
+    writeln!(o, "    }}").unwrap();
+    writeln!(o, "    rope_cos_sin_rows(&mut s.brope_cs, &s.inv_freq, pos0, m, DIMS.rope_scale);").unwrap();
+    writeln!(o, "    let kv = DIMS.kv_dim();").unwrap();
+    writeln!(o, "    g.begin();").unwrap();
+    o.push_str(&batch_body);
+    writeln!(o, "    if want_logits {{").unwrap();
+    writeln!(o, "        g.rmsnorm(BufId::Xb, BufId::Bx, (m - 1) * {dim}, &OUTPUT_NORM, {dim}, 1, DIMS.eps);").unwrap();
+    writeln!(o, "        g.matmul(BufId::Logits, 0, &OUTPUT, BufId::Xb, 0, 1, false);").unwrap();
+    writeln!(o, "    }}").unwrap();
+    writeln!(o, "    g.finish();").unwrap();
+    writeln!(o, "}}").unwrap();
 }
 
 /// Generate `payload.rs`: weight + tokenizer embedding.
@@ -406,16 +541,20 @@ pub fn emit_payload_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "/// directive. The OS loader maps the section lazily: starting the binary").unwrap();
     writeln!(o, "/// costs no I/O and weights are paged in on first touch (zero-copy).").unwrap();
     writeln!(o, "pub const WEIGHTS_LEN: usize = {len};\n").unwrap();
-    writeln!(o, "#[cfg(target_os = \"macos\")]").unwrap();
-    writeln!(o, "std::arch::global_asm!(").unwrap();
     // A private section: Mach-O arm64 relocation addends are 24-bit, so the
     // compiler's own constants must not share a section with the blob.
-    writeln!(o, "    \".section __TEXT,__aot_weights\",").unwrap();
-    writeln!(o, "    \".balign 64\",").unwrap();
+    // GPU builds place it in __DATA, page aligned: Metal wires the pages of
+    // the weights, and wired copies of __TEXT pages fail code-signature
+    // validation when the CPU touches them afterwards (see rt/weights.rs).
+    let (segment, align) = if opts.gpu.is_some() { ("__DATA", 16384) } else { ("__TEXT", 64) };
+    writeln!(o, "#[cfg(target_os = \"macos\")]").unwrap();
+    writeln!(o, "std::arch::global_asm!(").unwrap();
+    writeln!(o, "    \".section {segment},__aot_weights\",").unwrap();
+    writeln!(o, "    \".balign {align}\",").unwrap();
     writeln!(o, "    \".globl _aot_weights_start\",").unwrap();
     writeln!(o, "    \"_aot_weights_start:\",").unwrap();
     writeln!(o, "    \".incbin \\\"{path}\\\", {skip}, {len}\",").unwrap();
-    writeln!(o, "    \".balign 64\",").unwrap();
+    writeln!(o, "    \".balign {align}\",").unwrap();
     writeln!(o, ");\n").unwrap();
     writeln!(o, "#[cfg(not(target_os = \"macos\"))]").unwrap();
     writeln!(o, "std::arch::global_asm!(").unwrap();
@@ -431,6 +570,15 @@ pub fn emit_payload_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "    static aot_weights_start: u8;").unwrap();
     writeln!(o, "}}\n").unwrap();
     writeln!(o, "pub fn weights(_path: Option<&Path>) -> std::io::Result<&'static [u8]> {{").unwrap();
+    if opts.gpu.is_some() {
+        writeln!(o, "    // Re-map the section from the executable file (MAP_SHARED) so the GPU").unwrap();
+        writeln!(o, "    // can wire its pages without copying them; the loader's own private").unwrap();
+        writeln!(o, "    // mapping below is the fallback (the GPU then copies on first use).").unwrap();
+        writeln!(o, "    #[cfg(target_os = \"macos\")]").unwrap();
+        writeln!(o, "    if let Ok(m) = crate::rt::weights::map_own_section(\"{segment}\", \"__aot_weights\", WEIGHTS_LEN) {{").unwrap();
+        writeln!(o, "        return Ok(m);").unwrap();
+        writeln!(o, "    }}").unwrap();
+    }
     writeln!(o, "    // SAFETY: the symbol marks WEIGHTS_LEN bytes of read-only data placed").unwrap();
     writeln!(o, "    // by the assembler directive above; it lives for the whole process.").unwrap();
     writeln!(o, "    Ok(unsafe {{ std::slice::from_raw_parts(std::ptr::addr_of!(aot_weights_start), WEIGHTS_LEN) }})").unwrap();
@@ -479,7 +627,8 @@ fn emit_prefix_kv(o: &mut String, opts: &EmitOptions) {
     }
 }
 
-pub fn emit_main_rs(spec: &ModelSpec) -> String {
+pub fn emit_main_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
+    let (gpu_fwd, gpu_batch) = if opts.gpu.is_some() { ("Some(model::forward_gpu)", "Some(model::forward_batch_gpu)") } else { ("None", "None") };
     format!(
         "//! Generated by aot-llm: standalone inference binary for `{}`.\n\
          #![allow(dead_code, unused_imports, clippy::all)]\n\n\
@@ -492,6 +641,8 @@ pub fn emit_main_rs(spec: &ModelSpec) -> String {
          \x20       info: &model::INFO,\n\
          \x20       forward: model::forward,\n\
          \x20       forward_batch: model::forward_batch,\n\
+         \x20       forward_gpu: {gpu_fwd},\n\
+         \x20       forward_batch_gpu: {gpu_batch},\n\
          \x20       rope_freqs: model::ROPE_FREQS,\n\
          \x20       tokenizer_blob: payload::tokenizer(),\n\
          \x20       prefix_kv: payload::prefix_kv(),\n\
@@ -500,7 +651,9 @@ pub fn emit_main_rs(spec: &ModelSpec) -> String {
          \x20   }};\n\
          \x20   std::process::exit(rt::app::main(runtime));\n\
          }}\n",
-        spec.name
+        spec.name,
+        gpu_fwd = gpu_fwd,
+        gpu_batch = gpu_batch,
     )
 }
 
@@ -573,7 +726,7 @@ pub fn write_project(dir: &Path, spec: &ModelSpec, tokenizer_blob: &[u8], opts: 
     fs::write(dir.join("Cargo.toml"), emit_cargo_toml(opts))?;
     fs::write(dir.join("README.md"), emit_readme(spec, opts))?;
     fs::write(dir.join("tokenizer.bin"), tokenizer_blob)?;
-    fs::write(src.join("main.rs"), emit_main_rs(spec))?;
+    fs::write(src.join("main.rs"), emit_main_rs(spec, opts))?;
     fs::write(src.join("model.rs"), emit_model_rs(spec, opts))?;
     fs::write(src.join("payload.rs"), emit_payload_rs(spec, opts))?;
     for (name, contents) in RT_SOURCES {

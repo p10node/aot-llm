@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use aot_codegen::build::{cargo_build, BuildOptions};
-use aot_codegen::emit::{crate_name_from, write_project, EmitOptions};
+use aot_codegen::emit::{crate_name_from, write_project, EmitOptions, GpuBackend};
 use aot_codegen::model::ModelSpec;
 use aot_codegen::tokenizer::{build_blob, chat_format_name};
 use aot_gguf::{Gguf, MetaValue};
@@ -61,6 +61,11 @@ enum Cmd {
         /// that start with it (same tokenization) skip re-evaluating it.
         #[arg(long, conflicts_with = "system")]
         prefix: Option<String>,
+        /// Also compile a GPU backend into the binary: `metal` (macOS,
+        /// Apple Silicon). The binary picks the GPU by default and keeps the
+        /// CPU path (`--device cpu`).
+        #[arg(long, value_name = "BACKEND")]
+        gpu: Option<String>,
     },
     /// Print metadata and tensors of a GGUF file.
     Inspect {
@@ -89,8 +94,8 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Compile { model, output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix } => {
-            compile(&model, &output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix)
+        Cmd::Compile { model, output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix, gpu } => {
+            compile(&model, &output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix, gpu)
         }
         Cmd::Inspect { model, tensors, metadata } => inspect(&model, tensors, metadata),
         Cmd::Tokenize { model, text, no_bos, chat } => tokenize(&model, &text, no_bos, chat),
@@ -126,8 +131,23 @@ fn compile(
     name: Option<String>,
     system: Option<String>,
     prefix: Option<String>,
+    gpu: Option<String>,
 ) -> Result<()> {
     let t0 = Instant::now();
+    let gpu = match gpu.as_deref() {
+        None => None,
+        Some("metal") => {
+            let for_macos = match &target {
+                Some(t) => t.contains("apple-darwin"),
+                None => cfg!(target_os = "macos"),
+            };
+            if !for_macos {
+                bail!("--gpu metal needs a macOS target (host or --target aarch64-apple-darwin)");
+            }
+            Some(GpuBackend::Metal)
+        }
+        Some(other) => bail!("unknown GPU backend {other:?} (supported: metal)"),
+    };
     let model = model.canonicalize().with_context(|| format!("model {} not found", model.display()))?;
     let g = Gguf::open(&model).with_context(|| format!("parsing {}", model.display()))?;
     eprintln!("[1/4] parsed {} (GGUF v{}, {} tensors, {} metadata keys)", model.display(), g.version, g.tensors.len(), g.metadata.len());
@@ -166,9 +186,15 @@ fn compile(
         PathBuf::from(s)
     });
     let crate_name = name.unwrap_or_else(|| crate_name_from(&output.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
-    let mut opts = EmitOptions { crate_name: crate_name.clone(), sidecar, native, gguf_path: model.clone(), compiler_version: aot_codegen::VERSION.to_string(), target: target.clone(), prefix_kv_path: None };
+    let mut opts = EmitOptions { crate_name: crate_name.clone(), sidecar, native, gguf_path: model.clone(), compiler_version: aot_codegen::VERSION.to_string(), target: target.clone(), prefix_kv_path: None, gpu };
     write_project(&dir, &spec, &blob, &opts).with_context(|| format!("writing project to {}", dir.display()))?;
-    eprintln!("[3/4] generated project in {} (crate `{crate_name}`, {} layers unrolled, weights {})", dir.display(), d.n_layer, if sidecar { "sidecar" } else { "embedded" });
+    eprintln!(
+        "[3/4] generated project in {} (crate `{crate_name}`, {} layers unrolled, weights {}{})",
+        dir.display(),
+        d.n_layer,
+        if sidecar { "sidecar" } else { "embedded" },
+        gpu.map(|g| format!(", gpu: {}", g.name())).unwrap_or_default()
+    );
     if emit_only {
         eprintln!("      --emit-only: skipping cargo build");
         return Ok(());

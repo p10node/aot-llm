@@ -108,6 +108,58 @@ macro_rules! neon_kernels {
                 vaddvq_f32(vaddq_f32(acc0, acc1))
             }
 
+            /// Expand the 32 fifth bits of a Q5_0 block into the `0x10` bit
+            /// of 32 bytes: lanes test their own bit of the broadcast qh byte.
+            #[inline]
+            #[target_feature(enable = $feat)]
+            unsafe fn q5_0_high(b: *const u8) -> (uint8x16_t, uint8x16_t) {
+                const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+                let bits = vld1q_u8(BITS.as_ptr());
+                let h16 = vdupq_n_u8(0x10);
+                let lo = vcombine_u8(vdup_n_u8(*b.add(2)), vdup_n_u8(*b.add(3)));
+                let hi = vcombine_u8(vdup_n_u8(*b.add(4)), vdup_n_u8(*b.add(5)));
+                (vandq_u8(vtstq_u8(lo, bits), h16), vandq_u8(vtstq_u8(hi, bits), h16))
+            }
+
+            /// One Q5_0 block (22 bytes) against one Q8_0 block.
+            #[inline]
+            #[target_feature(enable = $feat)]
+            unsafe fn q5_0_block(b: *const u8, y: &BlockQ8_0, m4: uint8x16_t, s16: int8x16_t) -> (int32x4_t, f32) {
+                let d = f16_at(b) * y.d;
+                let q = vld1q_u8(b.add(6));
+                let (hl, hh) = q5_0_high(b);
+                let lo = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q, m4), hl)), s16);
+                let hi = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(q), hh)), s16);
+                let yp = y.qs.as_ptr();
+                let p = vdot(vdot(vdupq_n_s32(0), lo, vld1q_s8(yp)), hi, vld1q_s8(yp.add(16)));
+                (p, d)
+            }
+
+            #[target_feature(enable = $feat)]
+            pub unsafe fn dot_q5_0_q8_0(w: &[u8], x: &[BlockQ8_0]) -> f32 {
+                let nb = x.len();
+                debug_assert!(w.len() >= nb * Q5_0_SIZE);
+                let m4 = vdupq_n_u8(0x0F);
+                let s16 = vdupq_n_s8(16);
+                let mut acc0 = vdupq_n_f32(0.0);
+                let mut acc1 = vdupq_n_f32(0.0);
+                let wp = w.as_ptr();
+                let mut i = 0;
+                let xp = x.as_ptr();
+                while i + 2 <= nb {
+                    let (p0, d0) = q5_0_block(wp.add(i * Q5_0_SIZE), &*xp.add(i), m4, s16);
+                    let (p1, d1) = q5_0_block(wp.add((i + 1) * Q5_0_SIZE), &*xp.add(i + 1), m4, s16);
+                    acc0 = vmlaq_n_f32(acc0, vcvtq_f32_s32(p0), d0);
+                    acc1 = vmlaq_n_f32(acc1, vcvtq_f32_s32(p1), d1);
+                    i += 2;
+                }
+                if i < nb {
+                    let (p0, d0) = q5_0_block(wp.add(i * Q5_0_SIZE), &x[i], m4, s16);
+                    acc0 = vmlaq_n_f32(acc0, vcvtq_f32_s32(p0), d0);
+                }
+                vaddvq_f32(vaddq_f32(acc0, acc1))
+            }
+
             #[inline]
             #[target_feature(enable = $feat)]
             unsafe fn q8_0_block(b: *const u8, y: &BlockQ8_0) -> (int32x4_t, f32) {
@@ -217,16 +269,8 @@ macro_rules! neon_kernels {
                         let h0 = vaddq_u8(vshrq_n_u8::<4>(q0), vandq_u8(vtstq_u8(qh0, u2), m16));
                         let h1 = vaddq_u8(vshrq_n_u8::<4>(q1), vandq_u8(vtstq_u8(qh1, u2), m16));
                         let yj = yp.add(64 * j);
-                        let p_lo = vdot(
-                            vdot(zero, vreinterpretq_s8_u8(l0), vld1q_s8(yj)),
-                            vreinterpretq_s8_u8(l1),
-                            vld1q_s8(yj.add(16)),
-                        );
-                        let p_hi = vdot(
-                            vdot(zero, vreinterpretq_s8_u8(h0), vld1q_s8(yj.add(32))),
-                            vreinterpretq_s8_u8(h1),
-                            vld1q_s8(yj.add(48)),
-                        );
+                        let p_lo = vdot(vdot(zero, vreinterpretq_s8_u8(l0), vld1q_s8(yj)), vreinterpretq_s8_u8(l1), vld1q_s8(yj.add(16)));
+                        let p_hi = vdot(vdot(zero, vreinterpretq_s8_u8(h0), vld1q_s8(yj.add(32))), vreinterpretq_s8_u8(h1), vld1q_s8(yj.add(48)));
                         sumi = vmlaq_n_s32(sumi, p_lo, sc[2 * j]);
                         sumi = vmlaq_n_s32(sumi, p_hi, sc[2 * j + 1]);
                     }
@@ -308,12 +352,38 @@ macro_rules! neon_kernels {
                         }
                     }
                 }
-                [
-                    vaddvq_f32(vaddq_f32(acc0[0], acc1[0])),
-                    vaddvq_f32(vaddq_f32(acc0[1], acc1[1])),
-                    vaddvq_f32(vaddq_f32(acc0[2], acc1[2])),
-                    vaddvq_f32(vaddq_f32(acc0[3], acc1[3])),
-                ]
+                [vaddvq_f32(vaddq_f32(acc0[0], acc1[0])), vaddvq_f32(vaddq_f32(acc0[1], acc1[1])), vaddvq_f32(vaddq_f32(acc0[2], acc1[2])), vaddvq_f32(vaddq_f32(acc0[3], acc1[3]))]
+            }
+
+            #[target_feature(enable = $feat)]
+            pub unsafe fn dot_q5_0_q8_0_x4(w: &[u8], xs: [&[BlockQ8_0]; 4]) -> [f32; 4] {
+                let nb = xs[0].len();
+                debug_assert!(w.len() >= nb * Q5_0_SIZE);
+                let m4 = vdupq_n_u8(0x0F);
+                let s16 = vdupq_n_s8(16);
+                let zero = vdupq_n_s32(0);
+                let mut acc0 = [vdupq_n_f32(0.0); 4];
+                let mut acc1 = [vdupq_n_f32(0.0); 4];
+                let wp = w.as_ptr();
+                for i in 0..nb {
+                    let b = wp.add(i * Q5_0_SIZE);
+                    let d = f16_at(b);
+                    let q = vld1q_u8(b.add(6));
+                    let (hl, hh) = q5_0_high(b);
+                    let lo = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q, m4), hl)), s16);
+                    let hi = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(q), hh)), s16);
+                    for k in 0..4 {
+                        let y = xs[k].get_unchecked(i);
+                        let yp = y.qs.as_ptr();
+                        let p = vdot(vdot(zero, lo, vld1q_s8(yp)), hi, vld1q_s8(yp.add(16)));
+                        if i % 2 == 0 {
+                            acc0[k] = vmlaq_n_f32(acc0[k], vcvtq_f32_s32(p), d * y.d);
+                        } else {
+                            acc1[k] = vmlaq_n_f32(acc1[k], vcvtq_f32_s32(p), d * y.d);
+                        }
+                    }
+                }
+                [vaddvq_f32(vaddq_f32(acc0[0], acc1[0])), vaddvq_f32(vaddq_f32(acc0[1], acc1[1])), vaddvq_f32(vaddq_f32(acc0[2], acc1[2])), vaddvq_f32(vaddq_f32(acc0[3], acc1[3]))]
             }
 
             #[target_feature(enable = $feat)]
@@ -340,12 +410,7 @@ macro_rules! neon_kernels {
                         }
                     }
                 }
-                [
-                    vaddvq_f32(vaddq_f32(acc0[0], acc1[0])),
-                    vaddvq_f32(vaddq_f32(acc0[1], acc1[1])),
-                    vaddvq_f32(vaddq_f32(acc0[2], acc1[2])),
-                    vaddvq_f32(vaddq_f32(acc0[3], acc1[3])),
-                ]
+                [vaddvq_f32(vaddq_f32(acc0[0], acc1[0])), vaddvq_f32(vaddq_f32(acc0[1], acc1[1])), vaddvq_f32(vaddq_f32(acc0[2], acc1[2])), vaddvq_f32(vaddq_f32(acc0[3], acc1[3]))]
             }
 
             #[target_feature(enable = $feat)]
@@ -538,10 +603,12 @@ macro_rules! safe_wrappers_x4 {
 
 safe_wrappers_x4! {
     dp_q4_0_x4 = dotprod::dot_q4_0_q8_0_x4 : BlockQ8_0;
+    dp_q5_0_x4 = dotprod::dot_q5_0_q8_0_x4 : BlockQ8_0;
     dp_q8_0_x4 = dotprod::dot_q8_0_q8_0_x4 : BlockQ8_0;
     dp_q4_k_x4 = dotprod::dot_q4_k_q8_k_x4 : BlockQ8_K;
     dp_q6_k_x4 = dotprod::dot_q6_k_q8_k_x4 : BlockQ8_K;
     pl_q4_0_x4 = plain::dot_q4_0_q8_0_x4 : BlockQ8_0;
+    pl_q5_0_x4 = plain::dot_q5_0_q8_0_x4 : BlockQ8_0;
     pl_q8_0_x4 = plain::dot_q8_0_q8_0_x4 : BlockQ8_0;
     pl_q4_k_x4 = plain::dot_q4_k_q8_k_x4 : BlockQ8_K;
     pl_q6_k_x4 = plain::dot_q6_k_q8_k_x4 : BlockQ8_K;
@@ -549,11 +616,13 @@ safe_wrappers_x4! {
 
 safe_wrappers! {
     dp_q4_0 = dotprod::dot_q4_0_q8_0 : BlockQ8_0;
+    dp_q5_0 = dotprod::dot_q5_0_q8_0 : BlockQ8_0;
     dp_q8_0 = dotprod::dot_q8_0_q8_0 : BlockQ8_0;
     dp_q4_k = dotprod::dot_q4_k_q8_k : BlockQ8_K;
     dp_q5_k = dotprod::dot_q5_k_q8_k : BlockQ8_K;
     dp_q6_k = dotprod::dot_q6_k_q8_k : BlockQ8_K;
     pl_q4_0 = plain::dot_q4_0_q8_0 : BlockQ8_0;
+    pl_q5_0 = plain::dot_q5_0_q8_0 : BlockQ8_0;
     pl_q8_0 = plain::dot_q8_0_q8_0 : BlockQ8_0;
     pl_q4_k = plain::dot_q4_k_q8_k : BlockQ8_K;
     pl_q5_k = plain::dot_q5_k_q8_k : BlockQ8_K;
@@ -566,6 +635,7 @@ safe_wrappers! {
 pub const DOTPROD_KERNELS: super::Kernels = super::Kernels {
     name: "neon+dotprod",
     q4_0_q8_0: dp_q4_0,
+    q5_0_q8_0: dp_q5_0,
     q8_0_q8_0: dp_q8_0,
     q4_k_q8_k: dp_q4_k,
     q5_k_q8_k: dp_q5_k,
@@ -574,6 +644,7 @@ pub const DOTPROD_KERNELS: super::Kernels = super::Kernels {
     bf16_f32: bf16,
     f32_f32: f32w,
     q4_0_q8_0_x4: Some(dp_q4_0_x4),
+    q5_0_q8_0_x4: Some(dp_q5_0_x4),
     q8_0_q8_0_x4: Some(dp_q8_0_x4),
     q4_k_q8_k_x4: Some(dp_q4_k_x4),
     q6_k_q8_k_x4: Some(dp_q6_k_x4),
@@ -582,6 +653,7 @@ pub const DOTPROD_KERNELS: super::Kernels = super::Kernels {
 pub const PLAIN_KERNELS: super::Kernels = super::Kernels {
     name: "neon",
     q4_0_q8_0: pl_q4_0,
+    q5_0_q8_0: pl_q5_0,
     q8_0_q8_0: pl_q8_0,
     q4_k_q8_k: pl_q4_k,
     q5_k_q8_k: pl_q5_k,
@@ -590,6 +662,7 @@ pub const PLAIN_KERNELS: super::Kernels = super::Kernels {
     bf16_f32: bf16,
     f32_f32: f32w,
     q4_0_q8_0_x4: Some(pl_q4_0_x4),
+    q5_0_q8_0_x4: Some(pl_q5_0_x4),
     q8_0_q8_0_x4: Some(pl_q8_0_x4),
     q4_k_q8_k_x4: Some(pl_q4_k_x4),
     q6_k_q8_k_x4: Some(pl_q6_k_x4),

@@ -19,9 +19,10 @@ struct MmArgs {
     uint rope;        // 1: rotate output pairs with the (cos, sin) table (q / k projections)
     uint head_dim;    // for rope: output row r is dimension r % head_dim of its head
     uint rot_dim;     // for rope: dimensions >= rot_dim are left alone
+    uint bias;        // 1: add bias[row] to every output row (projection biases)
 };
 struct NormArgs { uint n; uint m; float eps; };
-struct RopeArgs { uint m; uint n_head; uint n_kv_head; uint head_dim; uint rot_dim; uint q_stride; uint k_stride; };
+struct RopeArgs { uint m; uint n_head; uint n_kv_head; uint head_dim; uint rot_dim; uint q_stride; uint k_stride; uint neox; };
 struct AttnArgs { uint m; uint pos0; uint n_head; uint gqa; uint head_dim; uint kv_dim; uint q_stride; uint ctx; float scale; };
 struct SiluArgs { uint n; };
 
@@ -345,6 +346,61 @@ struct Q40 {
     }
 };
 
+/// Q5_0: one 32-element block (22 bytes: f16 d, u32 of fifth bits, 16
+/// nibble bytes) per lane and iteration.
+struct Q50 {
+    enum : uint { BLOCK = 32, BLOCK_BYTES = 22, ITER = 1024, NX = 8 };
+    static uint lane_elem(uint lane) { return lane * 32; }
+    static uint x_off(uint lane, uint k) { return lane * 32 + 4 * k; }
+    struct W { float d; uint qh; uchar4 q[4]; };
+    static W load(device const uchar* row, uint elem) {
+        device const uchar* b = row + (elem / 32) * 22;
+        W w;
+        w.d = f16f(u16at(b));
+        w.qh = (uint)b[2] | ((uint)b[3] << 8) | ((uint)b[4] << 16) | ((uint)b[5] << 24);
+        device const packed_uchar4* q = (device const packed_uchar4*)(b + 6);
+        for (uint i = 0; i < 4; i++) w.q[i] = q[i];
+        return w;
+    }
+    /// Elements 4i..4i+3 (low nibbles, bits 4i..) and 16+4i.. (high nibbles, bits 16+4i..), still offset by 16.
+    static void elems(thread const W& w, uint i, thread float4& lo, thread float4& hi) {
+        const uint4 sh = uint4(0, 1, 2, 3) + 4 * i;
+        const uint4 hl = ((uint4(w.qh) >> sh) & 1u) << 4;
+        const uint4 hh = ((uint4(w.qh) >> (sh + 16)) & 1u) << 4;
+        lo = float4(uint4(w.q[i] & 0xF) | hl);
+        hi = float4(uint4(w.q[i] >> 4) | hh);
+    }
+    static float dot(thread const W& w, thread const float4* xv) {
+        float s = 0.0f, xs = 0.0f;
+        for (uint i = 0; i < 4; i++) {
+            float4 lo, hi;
+            elems(w, i, lo, hi);
+            s += metal::dot(lo, xv[i]) + metal::dot(hi, xv[4 + i]);
+            xs += sum4(xv[i]) + sum4(xv[4 + i]);
+        }
+        return w.d * (s - 16.0f * xs);
+    }
+    static void dequant(thread const W& w, thread float4* out) {
+        for (uint i = 0; i < 4; i++) {
+            float4 lo, hi;
+            elems(w, i, lo, hi);
+            out[i] = w.d * (lo - 16.0f);
+            out[4 + i] = w.d * (hi - 16.0f);
+        }
+    }
+    static void dequant8(device const uchar* row, uint col, thread float* out) {
+        const W w = load(row, col);
+        const uint within = col % 32;
+        for (uint i = 0; i < 2; i++) {
+            const uint k = (within < 16 ? within : within - 16) / 4 + i;
+            float4 lo, hi;
+            elems(w, k, lo, hi);
+            const float4 v = w.d * ((within < 16 ? lo : hi) - 16.0f);
+            out[4 * i] = v.x; out[4 * i + 1] = v.y; out[4 * i + 2] = v.z; out[4 * i + 3] = v.w;
+        }
+    }
+};
+
 /// Q8_0: one 32-element block (34 bytes) per lane and iteration.
 struct Q80 {
     enum : uint { BLOCK = 32, BLOCK_BYTES = 34, ITER = 1024, NX = 8 };
@@ -455,6 +511,7 @@ kernel void kernel_mv(
     device float* y [[buffer(2)]],
     constant MmArgs& a [[buffer(3)]],
     device const float* cs [[buffer(4)]],
+    device const float* bias [[buffer(5)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint tiisg [[thread_index_in_simdgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]])
@@ -476,6 +533,9 @@ kernel void kernel_mv(
     float v[NR];
     for (int i = 0; i < NR; i++) v[i] = simd_sum(sums[i]);
     if (tiisg != 0) return;
+    if (a.bias) {
+        for (int i = 0; i < NR; i++) v[i] += bias[min(row0 + i, a.rows - 1)];
+    }
     if (a.rope) {
         for (int i = 0; i + 1 < NR; i += 2) {
             const uint dim = (row0 + i) % a.head_dim;
@@ -514,6 +574,7 @@ kernel void kernel_mm(
     device const float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
     constant MmArgs& a [[buffer(3)]],
+    device const float* bias [[buffer(4)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]])
@@ -566,11 +627,12 @@ kernel void kernel_mm(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint row = row0 + fr;
     if (row < a.rows) {
+        const float b = a.bias ? bias[row] : 0.0f;
         for (uint i = 0; i < 8; i++) {
             const uint t = in0 + fc + i;
             if (t < a.m) {
                 device float* yp = y + t * a.y_stride + row;
-                const float v = sa[fr * MM_T + fc + i];
+                const float v = sa[fr * MM_T + fc + i] + b;
                 *yp = a.accumulate ? (*yp + v) : v;
             }
         }
@@ -630,6 +692,7 @@ MM_KERNELS(F32W, "f32")
 MM_KERNELS(F16W, "f16")
 MM_KERNELS(BF16W, "bf16")
 MM_KERNELS(Q40, "q4_0")
+MM_KERNELS(Q50, "q5_0")
 MM_KERNELS(Q80, "q8_0")
 MM_KERNELS(Q4K, "q4_k")
 MM_KERNELS(Q5K, "q5_k")
@@ -687,10 +750,13 @@ kernel void kernel_rope(
     device float* v = (h < a.n_head) ? (q + t * a.q_stride + h * a.head_dim) : (k + t * a.k_stride + (h - a.n_head) * a.head_dim);
     const float c = cs[t * a.rot_dim + 2 * i];
     const float s = cs[t * a.rot_dim + 2 * i + 1];
-    const float x0 = v[2 * i];
-    const float x1 = v[2 * i + 1];
-    v[2 * i] = x0 * c - x1 * s;
-    v[2 * i + 1] = x0 * s + x1 * c;
+    // Adjacent pairs (Llama) or (i, i + rot_dim / 2) pairs (NEOX: Qwen).
+    const uint i0 = a.neox ? i : 2 * i;
+    const uint i1 = a.neox ? i + half_rot : 2 * i + 1;
+    const float x0 = v[i0];
+    const float x1 = v[i1];
+    v[i0] = x0 * c - x1 * s;
+    v[i1] = x0 * s + x1 * c;
 }
 
 // ---------------------------------------------------------------------------

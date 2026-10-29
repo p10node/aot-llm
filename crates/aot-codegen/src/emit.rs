@@ -66,32 +66,28 @@ pub fn crate_name_from(s: &str) -> String {
 }
 
 fn tensor_lit(t: &TensorSpec) -> String {
-    format!(
-        "Tensor {{ name: {:?}, kind: Kind::{}, off: {}, len: {}, rows: {}, cols: {} }}",
-        t.name,
-        t.kind.rust_name(),
-        t.off,
-        t.len,
-        t.rows,
-        t.cols
-    )
+    format!("Tensor {{ name: {:?}, kind: Kind::{}, off: {}, len: {}, rows: {}, cols: {} }}", t.name, t.kind.rust_name(), t.off, t.len, t.rows, t.cols)
 }
 
-fn act_expr(a: Activation, src: &str) -> String {
+/// The activation operand of a matrix-vector product whose input is the
+/// first `n` floats of `s.{src}`.
+fn act_expr(a: Activation, src: &str, n: usize) -> String {
     match a {
         Activation::Q8_0 => "&s.aq0".into(),
         Activation::Q8_K => "&s.aqk".into(),
-        Activation::F32 => format!("&s.{src}"),
+        Activation::F32 => format!("&s.{src}[..{n}]"),
     }
 }
 
-/// Emit the activation quantization needed by `kinds` for input `src`.
-fn emit_quantize(out: &mut String, src: &str, kinds: impl Iterator<Item = Kind>) {
+/// Emit the activation quantization needed by `kinds` for the first `n`
+/// floats of `src` (buffers can be longer than the vector they hold: `xb`
+/// also receives the attention output of `q_dim` floats).
+fn emit_quantize(out: &mut String, src: &str, n: usize, kinds: impl Iterator<Item = Kind>) {
     let acts: BTreeSet<Activation> = kinds.map(Kind::activation).collect();
     for a in acts {
         match a {
-            Activation::Q8_0 => writeln!(out, "    quantize_q8_0(&s.{src}, &mut s.aq0);").unwrap(),
-            Activation::Q8_K => writeln!(out, "    quantize_q8_k(&s.{src}, &mut s.aqk);").unwrap(),
+            Activation::Q8_0 => writeln!(out, "    quantize_q8_0(&s.{src}[..{n}], &mut s.aq0);").unwrap(),
+            Activation::Q8_K => writeln!(out, "    quantize_q8_k(&s.{src}[..{n}], &mut s.aqk);").unwrap(),
             Activation::F32 => {}
         }
     }
@@ -118,20 +114,13 @@ fn bact_expr(a: Activation, src: &str, n: usize) -> String {
 }
 
 fn emit_matmul(out: &mut String, t: &TensorSpec, texpr: &str, dst: &str, src: &str) {
-    writeln!(
-        out,
-        "    matmul_{}(pool, &mut s.{dst}, w.bytes(&{texpr}), {}, m, {}, {});",
-        t.kind.fn_suffix(),
-        bact_expr(t.kind.activation(), src, t.cols),
-        t.rows,
-        t.cols
-    )
-    .unwrap();
+    writeln!(out, "    matmul_{}(pool, &mut s.{dst}, w.bytes(&{texpr}), {}, m, {}, {});", t.kind.fn_suffix(), bact_expr(t.kind.activation(), src, t.cols), t.rows, t.cols).unwrap();
 }
 
 fn emit_layer_batch(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec) {
     let d = &spec.dims;
-    let (dim, hidden, qd, kvd) = (d.dim, d.hidden, d.n_head * d.head_dim, d.n_kv_head * d.head_dim);
+    let f = &spec.flags;
+    let (dim, hidden, qd) = (d.dim, d.hidden, d.n_head * d.head_dim);
     writeln!(out, "/// Transformer block {i} over `m` consecutive prompt tokens starting at `pos0`.").unwrap();
     writeln!(out, "#[inline(never)]").unwrap();
     writeln!(out, "fn layer_{i}_batch(s: &mut State, w: &Weights, pool: &Pool, pos0: usize, m: usize) {{").unwrap();
@@ -141,8 +130,18 @@ fn emit_layer_batch(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec)
     emit_matmul(out, &l.wq, "l.wq", "bq", "bxb");
     emit_matmul(out, &l.wk, "l.wk", "bk", "bxb");
     emit_matmul(out, &l.wv, "l.wv", "bv", "bxb");
-    writeln!(out, "    rope_rows(&mut s.bq, m, {}, {}, {}, &s.brope_cs);", d.n_head, d.head_dim, d.rot_dim).unwrap();
-    writeln!(out, "    rope_rows(&mut s.bk, m, {}, {}, {}, &s.brope_cs);", d.n_kv_head, d.head_dim, d.rot_dim).unwrap();
+    if f.qkv_bias {
+        writeln!(out, "    add_bias_rows(&mut s.bq, w.f32s(&l.bq), m);").unwrap();
+        writeln!(out, "    add_bias_rows(&mut s.bk, w.f32s(&l.bk), m);").unwrap();
+        writeln!(out, "    add_bias_rows(&mut s.bv, w.f32s(&l.bv), m);").unwrap();
+    }
+    if f.qk_norm {
+        writeln!(out, "    rmsnorm_heads_rows(&mut s.bq, w.f32s(&l.q_norm), m, {}, {}, DIMS.eps);", d.n_head, d.head_dim).unwrap();
+        writeln!(out, "    rmsnorm_heads_rows(&mut s.bk, w.f32s(&l.k_norm), m, {}, {}, DIMS.eps);", d.n_kv_head, d.head_dim).unwrap();
+    }
+    let rope_fn = if f.rope_neox { "rope_neox_rows" } else { "rope_rows" };
+    writeln!(out, "    {rope_fn}(&mut s.bq, m, {}, {}, {}, &s.brope_cs);", d.n_head, d.head_dim, d.rot_dim).unwrap();
+    writeln!(out, "    {rope_fn}(&mut s.bk, m, {}, {}, {}, &s.brope_cs);", d.n_kv_head, d.head_dim, d.rot_dim).unwrap();
     writeln!(out, "    store_kv_rows(&mut s.k_cache, &mut s.v_cache, &s.bk, &s.bv, &DIMS, s.ctx, {i}, pos0, m);").unwrap();
     writeln!(out, "    attention_rows(pool, &mut s.bxb, &s.bq, &s.k_cache, &s.v_cache, &mut s.scores, &DIMS, s.ctx, {i}, pos0, m);").unwrap();
     emit_quantize_rows(out, "bxb", qd, [l.wo.kind].into_iter());
@@ -173,32 +172,24 @@ fn emit_layer_batch(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec)
     emit_quantize_rows(out, "bhb", hidden, [l.down.kind].into_iter());
     emit_matmul(out, &l.down, "l.down", "bxb2", "bhb");
     writeln!(out, "    add_inplace(&mut s.bx[..m * {dim}], &s.bxb2[..m * {dim}]);").unwrap();
-    let _ = kvd;
-    writeln!(out, "}}
-").unwrap();
+    writeln!(out, "}}\n").unwrap();
 }
 
 fn emit_matvec(out: &mut String, t: &TensorSpec, texpr: &str, dst: &str, src: &str) {
-    writeln!(
-        out,
-        "    matvec_{}(pool, &mut s.{dst}, w.bytes(&{texpr}), {}, {}, {});",
-        t.kind.fn_suffix(),
-        act_expr(t.kind.activation(), src),
-        t.rows,
-        t.cols
-    )
-    .unwrap();
+    writeln!(out, "    matvec_{}(pool, &mut s.{dst}, w.bytes(&{texpr}), {}, {}, {});", t.kind.fn_suffix(), act_expr(t.kind.activation(), src, t.cols), t.rows, t.cols).unwrap();
 }
 
 fn emit_layer(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec) {
     let d = &spec.dims;
+    let f = &spec.flags;
+    let (dim, qd) = (d.dim, d.n_head * d.head_dim);
     writeln!(out, "/// Transformer block {i}.").unwrap();
     writeln!(out, "#[inline(never)]").unwrap();
     writeln!(out, "fn layer_{i}(s: &mut State, w: &Weights, pool: &Pool, pos: usize) {{").unwrap();
     writeln!(out, "    let l = &LAYERS[{i}];").unwrap();
     // Attention.
     writeln!(out, "    rmsnorm(&mut s.xb, &s.x, w.f32s(&l.attn_norm), DIMS.eps);").unwrap();
-    emit_quantize(out, "xb", [l.wq.kind, l.wk.kind, l.wv.kind].into_iter());
+    emit_quantize(out, "xb", dim, [l.wq.kind, l.wk.kind, l.wv.kind].into_iter());
     let same = l.wq.kind == l.wk.kind && l.wk.kind == l.wv.kind && l.wq.kind.activation() != Activation::F32;
     if same {
         let (fn_name, dot_fn) = match l.wq.kind.activation() {
@@ -209,7 +200,7 @@ fn emit_layer(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec) {
         writeln!(
             out,
             "    {fn_name}(pool, [&mut s.q, &mut s.k, &mut s.v], [w.bytes(&l.wq), w.bytes(&l.wk), w.bytes(&l.wv)], {}, [{}, {}, {}], Kind::{kn}.row_bytes({}), {dot_fn}(Kind::{kn}));",
-            act_expr(l.wq.kind.activation(), "xb"),
+            act_expr(l.wq.kind.activation(), "xb", dim),
             l.wq.rows,
             l.wk.rows,
             l.wv.rows,
@@ -221,16 +212,26 @@ fn emit_layer(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec) {
         emit_matvec(out, &l.wk, "l.wk", "k", "xb");
         emit_matvec(out, &l.wv, "l.wv", "v", "xb");
     }
-    writeln!(out, "    rope(&mut s.q, {}, {}, {}, &s.rope_cs);", d.n_head, d.head_dim, d.rot_dim).unwrap();
-    writeln!(out, "    rope(&mut s.k, {}, {}, {}, &s.rope_cs);", d.n_kv_head, d.head_dim, d.rot_dim).unwrap();
+    if f.qkv_bias {
+        writeln!(out, "    add_inplace(&mut s.q, w.f32s(&l.bq));").unwrap();
+        writeln!(out, "    add_inplace(&mut s.k, w.f32s(&l.bk));").unwrap();
+        writeln!(out, "    add_inplace(&mut s.v, w.f32s(&l.bv));").unwrap();
+    }
+    if f.qk_norm {
+        writeln!(out, "    rmsnorm_heads(&mut s.q, w.f32s(&l.q_norm), {}, {}, DIMS.eps);", d.n_head, d.head_dim).unwrap();
+        writeln!(out, "    rmsnorm_heads(&mut s.k, w.f32s(&l.k_norm), {}, {}, DIMS.eps);", d.n_kv_head, d.head_dim).unwrap();
+    }
+    let rope_fn = if f.rope_neox { "rope_neox" } else { "rope" };
+    writeln!(out, "    {rope_fn}(&mut s.q, {}, {}, {}, &s.rope_cs);", d.n_head, d.head_dim, d.rot_dim).unwrap();
+    writeln!(out, "    {rope_fn}(&mut s.k, {}, {}, {}, &s.rope_cs);", d.n_kv_head, d.head_dim, d.rot_dim).unwrap();
     writeln!(out, "    store_kv(&mut s.k_cache, &mut s.v_cache, &s.k, &s.v, &DIMS, s.ctx, {i}, pos);").unwrap();
     writeln!(out, "    attention(pool, &mut s.xb, &s.q, &s.k_cache, &s.v_cache, &mut s.scores, &DIMS, s.ctx, {i}, pos);").unwrap();
-    emit_quantize(out, "xb", [l.wo.kind].into_iter());
+    emit_quantize(out, "xb", qd, [l.wo.kind].into_iter());
     emit_matvec(out, &l.wo, "l.wo", "xb2", "xb");
-    writeln!(out, "    add_inplace(&mut s.x, &s.xb2);").unwrap();
+    writeln!(out, "    add_inplace(&mut s.x, &s.xb2[..{dim}]);").unwrap();
     // Feed-forward.
     writeln!(out, "    rmsnorm(&mut s.xb, &s.x, w.f32s(&l.ffn_norm), DIMS.eps);").unwrap();
-    emit_quantize(out, "xb", [l.gate.kind, l.up.kind].into_iter());
+    emit_quantize(out, "xb", dim, [l.gate.kind, l.up.kind].into_iter());
     let fused = l.gate.kind == l.up.kind && l.gate.kind.activation() != Activation::F32;
     if fused {
         let (fn_name, dot_fn) = match l.gate.kind.activation() {
@@ -240,7 +241,7 @@ fn emit_layer(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec) {
         writeln!(
             out,
             "    {fn_name}(pool, &mut s.hb, &mut s.hb2, w.bytes(&l.gate), w.bytes(&l.up), {}, {}, Kind::{}.row_bytes({}), {dot_fn}(Kind::{}));",
-            act_expr(l.gate.kind.activation(), "xb"),
+            act_expr(l.gate.kind.activation(), "xb", dim),
             l.gate.rows,
             l.gate.kind.rust_name(),
             l.gate.cols,
@@ -252,10 +253,42 @@ fn emit_layer(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec) {
         emit_matvec(out, &l.up, "l.up", "hb2", "xb");
     }
     writeln!(out, "    silu_mul(&mut s.hb, &s.hb2);").unwrap();
-    emit_quantize(out, "hb", [l.down.kind].into_iter());
+    emit_quantize(out, "hb", d.hidden, [l.down.kind].into_iter());
     emit_matvec(out, &l.down, "l.down", "xb2", "hb");
-    writeln!(out, "    add_inplace(&mut s.x, &s.xb2);").unwrap();
+    writeln!(out, "    add_inplace(&mut s.x, &s.xb2[..{dim}]);").unwrap();
     writeln!(out, "}}\n").unwrap();
+}
+
+/// Names of the per-layer tensor fields of the generated `Layer` struct.
+fn layer_fields(spec: &ModelSpec) -> Vec<&'static str> {
+    let mut v = vec!["attn_norm", "wq", "wk", "wv", "wo", "ffn_norm", "gate", "up", "down"];
+    if spec.flags.qkv_bias {
+        v.extend(["bq", "bk", "bv"]);
+    }
+    if spec.flags.qk_norm {
+        v.extend(["q_norm", "k_norm"]);
+    }
+    v
+}
+
+fn layer_tensor<'a>(l: &'a LayerSpec, field: &str) -> &'a TensorSpec {
+    match field {
+        "attn_norm" => &l.attn_norm,
+        "wq" => &l.wq,
+        "wk" => &l.wk,
+        "wv" => &l.wv,
+        "wo" => &l.wo,
+        "ffn_norm" => &l.ffn_norm,
+        "gate" => &l.gate,
+        "up" => &l.up,
+        "down" => &l.down,
+        "bq" => l.bq.as_ref().expect("bias"),
+        "bk" => l.bk.as_ref().expect("bias"),
+        "bv" => l.bv.as_ref().expect("bias"),
+        "q_norm" => l.q_norm.as_ref().expect("q_norm"),
+        "k_norm" => l.k_norm.as_ref().expect("k_norm"),
+        _ => unreachable!(),
+    }
 }
 
 /// Generate `model.rs`: constants, the tensor table and the static forward pass.
@@ -265,7 +298,13 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "//! Generated by aot-llm {} from `{}`. Do not edit.", opts.compiler_version, spec.source).unwrap();
     writeln!(o, "//!").unwrap();
     writeln!(o, "//! Model: {} ({}, {})", spec.name, spec.arch, spec.file_type).unwrap();
-    writeln!(o, "//! Static pipeline: embedding -> [rmsnorm -> attention -> residual -> rmsnorm -> SwiGLU FFN -> residual] x {} -> rmsnorm -> logits", d.n_layer).unwrap();
+    let attn = match (spec.flags.qkv_bias, spec.flags.qk_norm, spec.flags.rope_neox) {
+        (true, _, true) => "attention(q/k/v + bias, NEOX RoPE)",
+        (_, true, true) => "attention(per-head q/k RMSNorm, NEOX RoPE)",
+        (_, _, true) => "attention(NEOX RoPE)",
+        _ => "attention",
+    };
+    writeln!(o, "//! Static pipeline: embedding -> [rmsnorm -> {attn} -> residual -> rmsnorm -> SwiGLU FFN -> residual] x {} -> rmsnorm -> logits", d.n_layer).unwrap();
     writeln!(o, "#![allow(clippy::all, dead_code)]\n").unwrap();
     writeln!(o, "use crate::rt::matvec::*;").unwrap();
     writeln!(o, "use crate::rt::ops::*;").unwrap();
@@ -316,26 +355,17 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
         None => writeln!(o, "pub const ROPE_FREQS: Option<Tensor> = None;").unwrap(),
     }
     writeln!(o).unwrap();
+    let fields = layer_fields(spec);
     writeln!(o, "pub struct Layer {{").unwrap();
-    for f in ["attn_norm", "wq", "wk", "wv", "wo", "ffn_norm", "gate", "up", "down"] {
+    for f in &fields {
         writeln!(o, "    pub {f}: Tensor,").unwrap();
     }
     writeln!(o, "}}\n").unwrap();
     writeln!(o, "pub static LAYERS: [Layer; {}] = [", d.n_layer).unwrap();
     for l in &spec.layers {
         writeln!(o, "    Layer {{").unwrap();
-        for (f, t) in [
-            ("attn_norm", &l.attn_norm),
-            ("wq", &l.wq),
-            ("wk", &l.wk),
-            ("wv", &l.wv),
-            ("wo", &l.wo),
-            ("ffn_norm", &l.ffn_norm),
-            ("gate", &l.gate),
-            ("up", &l.up),
-            ("down", &l.down),
-        ] {
-            writeln!(o, "        {f}: {},", tensor_lit(t)).unwrap();
+        for f in &fields {
+            writeln!(o, "        {f}: {},", tensor_lit(layer_tensor(l, f))).unwrap();
         }
         writeln!(o, "    }},").unwrap();
     }
@@ -363,7 +393,7 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "        return;").unwrap();
     writeln!(o, "    }}").unwrap();
     writeln!(o, "    rmsnorm(&mut s.xb, &s.x, w.f32s(&OUTPUT_NORM), DIMS.eps);").unwrap();
-    emit_quantize(&mut o, "xb", [out_t.kind].into_iter());
+    emit_quantize(&mut o, "xb", d.dim, [out_t.kind].into_iter());
     emit_matvec(&mut o, out_t, "OUTPUT", "logits", "xb");
     writeln!(o, "}}\n").unwrap();
 
@@ -387,7 +417,7 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "    }}").unwrap();
     writeln!(o, "    let last = (m - 1) * {dim};", dim = d.dim).unwrap();
     writeln!(o, "    rmsnorm(&mut s.xb, &s.bx[last..last + {dim}], w.f32s(&OUTPUT_NORM), DIMS.eps);", dim = d.dim).unwrap();
-    emit_quantize(&mut o, "xb", [out_t.kind].into_iter());
+    emit_quantize(&mut o, "xb", d.dim, [out_t.kind].into_iter());
     emit_matvec(&mut o, out_t, "OUTPUT", "logits", "xb");
     writeln!(o, "}}").unwrap();
     if opts.gpu.is_some() {
@@ -412,6 +442,23 @@ fn emit_gpu_forwards(o: &mut String, spec: &ModelSpec) {
     // both matrices share a format, and the residual adds are folded into
     // the wo / down products. RMSNorm stays a separate (12 us) dispatch:
     // folding it into the products was measured 2-3x slower.
+    let f = &spec.flags;
+    let (bq, bk, bv) = if f.qkv_bias { ("Some(&l.bq)", "Some(&l.bk)", "Some(&l.bv)") } else { ("None", "None", "None") };
+    // Per-head q / k RMSNorm (Qwen3), in place, before RoPE.
+    let qk_norm = |m: &str| -> String {
+        if f.qk_norm {
+            format!(
+                "        g.rmsnorm_at(BufId::{q}, 0, BufId::{q}, 0, &l.q_norm, {hd}, {m} * {nh}, DIMS.eps);
+        g.rmsnorm_at(BufId::KCache, kv_at, BufId::KCache, kv_at, &l.k_norm, {hd}, {m} * {nkv}, DIMS.eps);\n",
+                q = if m == "1" { "Q" } else { "Bq" },
+                hd = d.head_dim,
+                nh = d.n_head,
+                nkv = d.n_kv_head,
+            )
+        } else {
+            String::new()
+        }
+    };
     let decode_block = |l: &LayerSpec| -> String {
         let gate = if l.gate.kind == l.up.kind && l.gate.rows == l.up.rows {
             "        g.gate_up_silu(BufId::Hb, &l.gate, &l.up, BufId::Xb);\n".to_string()
@@ -422,13 +469,28 @@ fn emit_gpu_forwards(o: &mut String, spec: &ModelSpec) {
         g.silu_mul(BufId::Hb, BufId::Hb2, {hidden});\n"
             )
         };
+        // Llama: RoPE fused into the q / k products (adjacent pairs). NEOX
+        // pairs are half a head apart, so Qwen models rotate in a separate
+        // dispatch after the optional bias / per-head norm.
+        let qkv = if f.rope_neox {
+            format!(
+                "        g.mv(BufId::Q, 0, &l.wq, BufId::Xb, 0, None, MvOpts {{ bias: {bq}, ..MvOpts::default() }});
+        g.mv(BufId::KCache, kv_at, &l.wk, BufId::Xb, 0, None, MvOpts {{ bias: {bk}, ..MvOpts::default() }});
+        g.mv(BufId::VCache, kv_at, &l.wv, BufId::Xb, 0, None, MvOpts {{ bias: {bv}, ..MvOpts::default() }});
+{norm}        g.rope_ex(BufId::Q, BufId::KCache, kv_at, 1, BufId::RopeCs, &DIMS, true);\n",
+                norm = qk_norm("1")
+            )
+        } else {
+            format!(
+                "        g.mv(BufId::Q, 0, &l.wq, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::RopeCs), bias: {bq}, ..MvOpts::default() }});
+        g.mv(BufId::KCache, kv_at, &l.wk, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::RopeCs), bias: {bk}, ..MvOpts::default() }});
+        g.mv(BufId::VCache, kv_at, &l.wv, BufId::Xb, 0, None, MvOpts {{ bias: {bv}, ..MvOpts::default() }});\n"
+            )
+        };
         format!(
             "        let kv_at = (i * s.ctx + pos) * kv;
         g.rmsnorm(BufId::Xb, BufId::X, 0, &l.attn_norm, {dim}, 1, DIMS.eps);
-        g.mv(BufId::Q, 0, &l.wq, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::RopeCs), ..MvOpts::default() }});
-        g.mv(BufId::KCache, kv_at, &l.wk, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::RopeCs), ..MvOpts::default() }});
-        g.mv(BufId::VCache, kv_at, &l.wv, BufId::Xb, 0, None, MvOpts::default());
-        g.attention(BufId::Xb, BufId::Q, i, pos, 1, &DIMS, s.ctx);
+{qkv}        g.attention(BufId::Xb, BufId::Q, i, pos, 1, &DIMS, s.ctx);
         g.mv(BufId::X, 0, &l.wo, BufId::Xb, 0, None, MvOpts {{ accumulate: true, ..MvOpts::default() }});
         g.rmsnorm(BufId::Xb, BufId::X, 0, &l.ffn_norm, {dim}, 1, DIMS.eps);
 {gate}        g.mv(BufId::X, 0, &l.down, BufId::Hb, 0, None, MvOpts {{ accumulate: true, ..MvOpts::default() }});
@@ -453,10 +515,10 @@ fn emit_gpu_forwards(o: &mut String, spec: &ModelSpec) {
         "    for (i, l) in LAYERS.iter().enumerate() {{
         let kv_at = (i * s.ctx + pos0) * kv;
         g.rmsnorm(BufId::Bxb, BufId::Bx, 0, &l.attn_norm, {dim}, m, DIMS.eps);
-        g.matmul(BufId::Bq, 0, &l.wq, BufId::Bxb, 0, m, false);
-        g.matmul(BufId::KCache, kv_at, &l.wk, BufId::Bxb, 0, m, false);
-        g.matmul(BufId::VCache, kv_at, &l.wv, BufId::Bxb, 0, m, false);
-        g.rope(BufId::Bq, BufId::KCache, kv_at, m, BufId::BropeCs, &DIMS);
+        g.matmul_bias(BufId::Bq, 0, &l.wq, BufId::Bxb, 0, m, false, {bq});
+        g.matmul_bias(BufId::KCache, kv_at, &l.wk, BufId::Bxb, 0, m, false, {bk});
+        g.matmul_bias(BufId::VCache, kv_at, &l.wv, BufId::Bxb, 0, m, false, {bv});
+{norm}        g.rope_ex(BufId::Bq, BufId::KCache, kv_at, m, BufId::BropeCs, &DIMS, {neox});
         g.attention(BufId::Bxb, BufId::Bq, i, pos0, m, &DIMS, s.ctx);
         g.matmul(BufId::Bx, 0, &l.wo, BufId::Bxb, 0, m, true);
         g.rmsnorm(BufId::Bxb, BufId::Bx, 0, &l.ffn_norm, {dim}, m, DIMS.eps);
@@ -465,7 +527,9 @@ fn emit_gpu_forwards(o: &mut String, spec: &ModelSpec) {
         g.silu_mul(BufId::Bhb, BufId::Bhb2, m * {hidden});
         g.matmul(BufId::Bx, 0, &l.down, BufId::Bhb, 0, m, true);
     }}
-"
+",
+        norm = qk_norm("m"),
+        neox = f.rope_neox,
     );
     writeln!(o, "\n/// [`forward`] on the GPU: one command buffer for the whole step.").unwrap();
     writeln!(o, "#[cfg(target_os = \"macos\")]").unwrap();
@@ -694,11 +758,7 @@ pub fn emit_readme(spec: &ModelSpec, opts: &EmitOptions) -> String {
         name = opts.crate_name,
         ver = opts.compiler_version,
         src = spec.source,
-        note = if opts.sidecar {
-            "Weights are read from `<binary>.weights` at run time."
-        } else {
-            "The weights are read from the original GGUF file at build time (see `.incbin` in `src/payload.rs`), so keep it in place while rebuilding."
-        }
+        note = if opts.sidecar { "Weights are read from `<binary>.weights` at run time." } else { "The weights are read from the original GGUF file at build time (see `.incbin` in `src/payload.rs`), so keep it in place while rebuilding." }
     )
 }
 
@@ -711,9 +771,7 @@ pub fn cargo_config(opts: &EmitOptions) -> String {
         c.push_str("[build]\nrustflags = [\"-C\", \"target-cpu=native\"]\n\n");
     }
     if let Some(t) = opts.target.as_deref().filter(|t| t.contains("-musl")) {
-        c.push_str(&format!(
-            "[target.{t}]\nlinker = \"rust-lld\"\nrustflags = [\"-C\", \"target-feature=+crt-static\", \"-C\", \"link-self-contained=yes\"]\n"
-        ));
+        c.push_str(&format!("[target.{t}]\nlinker = \"rust-lld\"\nrustflags = [\"-C\", \"target-feature=+crt-static\", \"-C\", \"link-self-contained=yes\"]\n"));
     }
     c
 }

@@ -11,6 +11,7 @@
 //! | type | block | bytes | layout                                               |
 //! |------|-------|-------|------------------------------------------------------|
 //! | Q4_0 | 32    | 18    | f16 d, 16 x u8 nibbles (lo = elem j, hi = elem j+16)  |
+//! | Q5_0 | 32    | 22    | f16 d, u32 qh (5th bits), 16 x u8 nibbles             |
 //! | Q8_0 | 32    | 34    | f16 d, 32 x i8                                        |
 //! | Q4_K | 256   | 144   | f16 d, f16 dmin, 12 x u8 scales/mins, 128 x u8 nibbles|
 //! | Q5_K | 256   | 176   | f16 d, f16 dmin, 12 x u8 scales, 32 x u8 qh, 128 x qs |
@@ -22,6 +23,7 @@ pub const QK8_0: usize = 32;
 pub const QK_K: usize = 256;
 
 pub const Q4_0_SIZE: usize = 18;
+pub const Q5_0_SIZE: usize = 22;
 pub const Q8_0_SIZE: usize = 34;
 pub const Q4_K_SIZE: usize = 144;
 pub const Q5_K_SIZE: usize = 176;
@@ -35,6 +37,7 @@ pub enum Kind {
     F16,
     BF16,
     Q4_0,
+    Q5_0,
     Q8_0,
     Q4_K,
     Q5_K,
@@ -45,7 +48,7 @@ impl Kind {
     pub const fn block_size(self) -> usize {
         match self {
             Kind::F32 | Kind::F16 | Kind::BF16 => 1,
-            Kind::Q4_0 | Kind::Q8_0 => QK8_0,
+            Kind::Q4_0 | Kind::Q5_0 | Kind::Q8_0 => QK8_0,
             Kind::Q4_K | Kind::Q5_K | Kind::Q6_K => QK_K,
         }
     }
@@ -55,6 +58,7 @@ impl Kind {
             Kind::F32 => 4,
             Kind::F16 | Kind::BF16 => 2,
             Kind::Q4_0 => Q4_0_SIZE,
+            Kind::Q5_0 => Q5_0_SIZE,
             Kind::Q8_0 => Q8_0_SIZE,
             Kind::Q4_K => Q4_K_SIZE,
             Kind::Q5_K => Q5_K_SIZE,
@@ -73,6 +77,7 @@ impl Kind {
             Kind::F16 => "f16",
             Kind::BF16 => "bf16",
             Kind::Q4_0 => "q4_0",
+            Kind::Q5_0 => "q5_0",
             Kind::Q8_0 => "q8_0",
             Kind::Q4_K => "q4_K",
             Kind::Q5_K => "q5_K",
@@ -322,6 +327,21 @@ pub fn dequant_row_q4_0(row: &[u8], out: &mut [f32]) {
     }
 }
 
+pub fn dequant_row_q5_0(row: &[u8], out: &mut [f32]) {
+    for (i, chunk) in out.as_chunks_mut::<QK8_0>().0.iter_mut().enumerate() {
+        let b = &row[i * Q5_0_SIZE..(i + 1) * Q5_0_SIZE];
+        let d = read_f16(b, 0);
+        let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+        for j in 0..16 {
+            let q = b[6 + j];
+            let lo = (q & 0x0F) as u32 | (((qh >> j) & 1) << 4);
+            let hi = (q >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4);
+            chunk[j] = (lo as i32 - 16) as f32 * d;
+            chunk[j + 16] = (hi as i32 - 16) as f32 * d;
+        }
+    }
+}
+
 pub fn dequant_row_q8_0(row: &[u8], out: &mut [f32]) {
     for (i, chunk) in out.as_chunks_mut::<QK8_0>().0.iter_mut().enumerate() {
         let b = &row[i * Q8_0_SIZE..(i + 1) * Q8_0_SIZE];
@@ -414,6 +434,7 @@ pub fn dequant_row(kind: Kind, row: &[u8], out: &mut [f32]) {
         Kind::F16 => dequant_row_f16(row, out),
         Kind::BF16 => dequant_row_bf16(row, out),
         Kind::Q4_0 => dequant_row_q4_0(row, out),
+        Kind::Q5_0 => dequant_row_q5_0(row, out),
         Kind::Q8_0 => dequant_row_q8_0(row, out),
         Kind::Q4_K => dequant_row_q4_k(row, out),
         Kind::Q5_K => dequant_row_q5_k(row, out),

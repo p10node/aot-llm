@@ -51,6 +51,49 @@ pub fn rope(x: &mut [f32], n_heads: usize, head_dim: usize, rot_dim: usize, cs: 
     }
 }
 
+/// RoPE in the "NEOX" layout used by Qwen2 / Qwen3 (and GPT-NeoX): the
+/// rotated pairs are `(x[i], x[i + rot_dim / 2])` instead of adjacent
+/// elements. `cs` is the same interleaved (cos, sin) table as for [`rope`].
+pub fn rope_neox(x: &mut [f32], n_heads: usize, head_dim: usize, rot_dim: usize, cs: &[f32]) {
+    let half = rot_dim / 2;
+    for h in 0..n_heads {
+        let v = &mut x[h * head_dim..h * head_dim + rot_dim];
+        for i in 0..half {
+            let c = cs[2 * i];
+            let s = cs[2 * i + 1];
+            let x0 = v[i];
+            let x1 = v[i + half];
+            v[i] = x0 * c - x1 * s;
+            v[i + half] = x0 * s + x1 * c;
+        }
+    }
+}
+
+/// RMSNorm applied in place to each of the `n_heads` heads of `head_dim`
+/// elements with one shared weight vector of `head_dim` (Qwen3's q / k norm).
+pub fn rmsnorm_heads(x: &mut [f32], w: &[f32], n_heads: usize, head_dim: usize, eps: f32) {
+    debug_assert!(w.len() >= head_dim);
+    for h in 0..n_heads {
+        let v = &mut x[h * head_dim..(h + 1) * head_dim];
+        let mut ss = 0f32;
+        for &a in v.iter() {
+            ss += a * a;
+        }
+        let r = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+        for i in 0..head_dim {
+            v[i] = v[i] * r * w[i];
+        }
+    }
+}
+
+/// `x[i] += b[i]` for `m` rows of `b.len()` elements (projection biases).
+pub fn add_bias_rows(x: &mut [f32], b: &[f32], m: usize) {
+    let n = b.len();
+    for i in 0..m {
+        add_inplace(&mut x[i * n..(i + 1) * n], b);
+    }
+}
+
 /// In-place softmax.
 pub fn softmax(x: &mut [f32]) {
     let mut max = f32::NEG_INFINITY;
@@ -106,18 +149,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// query `q`, scores all cached keys, softmaxes and mixes cached values
 /// into `out`.
 #[allow(clippy::too_many_arguments)]
-pub fn attention(
-    pool: &Pool,
-    out: &mut [f32],
-    q: &[f32],
-    k_cache: &[f32],
-    v_cache: &[f32],
-    scores: &mut [f32],
-    d: &Dims,
-    ctx: usize,
-    layer: usize,
-    pos: usize,
-) {
+pub fn attention(pool: &Pool, out: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32], scores: &mut [f32], d: &Dims, ctx: usize, layer: usize, pos: usize) {
     let hd = d.head_dim;
     let kv = d.kv_dim();
     let gqa = d.gqa();
@@ -188,21 +220,48 @@ mod tests {
     }
 
     #[test]
+    fn rope_neox_rotates_half_offset_pairs() {
+        let inv = [1.0f32, 0.5];
+        let mut cs = [0f32; 4];
+        rope_cos_sin(&mut cs, &inv, std::f32::consts::FRAC_PI_2);
+        // head_dim 4: pairs (0, 2) rotated by pi/2 and (1, 3) by pi/4.
+        let mut x = [1.0f32, 1.0, 0.0, 0.0];
+        rope_neox(&mut x, 1, 4, 4, &cs);
+        assert!(x[0].abs() < 1e-6 && (x[2] - 1.0).abs() < 1e-6);
+        let r = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((x[1] - r).abs() < 1e-6 && (x[3] - r).abs() < 1e-6);
+        // Equivalent to the adjacent-pair layout after a permutation of the head.
+        let mut cs8 = [0f32; 8];
+        let inv8 = [1.0f32, 0.7, 0.4, 0.1];
+        rope_cos_sin(&mut cs8, &inv8, 3.0);
+        let src: Vec<f32> = (0..8).map(|i| i as f32 * 0.37 - 1.0).collect();
+        let mut neox = src.clone();
+        rope_neox(&mut neox, 1, 8, 8, &cs8);
+        let mut perm: Vec<f32> = (0..4).flat_map(|i| [src[i], src[i + 4]]).collect();
+        rope(&mut perm, 1, 8, 8, &cs8);
+        for i in 0..4 {
+            assert!((neox[i] - perm[2 * i]).abs() < 1e-6 && (neox[i + 4] - perm[2 * i + 1]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn rmsnorm_heads_normalises_each_head() {
+        let w = [2.0f32, 1.0];
+        let mut x = [3.0f32, 4.0, 0.5, 0.5];
+        rmsnorm_heads(&mut x, &w, 2, 2, 0.0);
+        let rms0 = ((9.0 + 16.0) / 2.0f32).sqrt();
+        let rms1 = 0.5f32;
+        assert!((x[0] - 2.0 * 3.0 / rms0).abs() < 1e-5 && (x[1] - 4.0 / rms0).abs() < 1e-5);
+        assert!((x[2] - 2.0 * 0.5 / rms1).abs() < 1e-5 && (x[3] - 0.5 / rms1).abs() < 1e-5);
+        let mut rows = [3.0f32, 4.0, 0.5, 0.5, 3.0, 4.0, 0.5, 0.5];
+        rmsnorm_heads_rows(&mut rows, &w, 2, 2, 2, 0.0);
+        assert_eq!(&rows[..4], &x);
+        assert_eq!(&rows[4..], &x);
+    }
+
+    #[test]
     fn attention_single_token_returns_value() {
-        let d = Dims {
-            dim: 8,
-            hidden: 8,
-            n_layer: 1,
-            n_head: 2,
-            n_kv_head: 1,
-            head_dim: 4,
-            rot_dim: 4,
-            vocab: 1,
-            n_ctx_train: 4,
-            eps: 1e-5,
-            rope_base: 10000.0,
-            rope_scale: 1.0,
-        };
+        let d = Dims { dim: 8, hidden: 8, n_layer: 1, n_head: 2, n_kv_head: 1, head_dim: 4, rot_dim: 4, vocab: 1, n_ctx_train: 4, eps: 1e-5, rope_base: 10000.0, rope_scale: 1.0 };
         let ctx = 4;
         let pool = Pool::new(2);
         let q = vec![1.0f32; 8];
@@ -246,6 +305,19 @@ pub fn rope_rows(x: &mut [f32], m: usize, n_heads: usize, head_dim: usize, rot_d
     }
 }
 
+/// [`rope_neox`] applied to each of the `m` rows of `x` with its own position table.
+pub fn rope_neox_rows(x: &mut [f32], m: usize, n_heads: usize, head_dim: usize, rot_dim: usize, cs: &[f32]) {
+    let n = n_heads * head_dim;
+    for i in 0..m {
+        rope_neox(&mut x[i * n..(i + 1) * n], n_heads, head_dim, rot_dim, &cs[i * rot_dim..(i + 1) * rot_dim]);
+    }
+}
+
+/// [`rmsnorm_heads`] over `m` rows of `n_heads * head_dim` elements.
+pub fn rmsnorm_heads_rows(x: &mut [f32], w: &[f32], m: usize, n_heads: usize, head_dim: usize, eps: f32) {
+    rmsnorm_heads(&mut x[..m * n_heads * head_dim], w, m * n_heads, head_dim, eps);
+}
+
 /// Store `m` consecutive key/value rows starting at `pos0`.
 #[allow(clippy::too_many_arguments)]
 pub fn store_kv_rows(k_cache: &mut [f32], v_cache: &mut [f32], k: &[f32], v: &[f32], d: &Dims, ctx: usize, layer: usize, pos0: usize, m: usize) {
@@ -259,19 +331,7 @@ pub fn store_kv_rows(k_cache: &mut [f32], v_cache: &mut [f32], k: &[f32], v: &[f
 /// (their keys/values must already be in the cache). Work items are
 /// (row, head) pairs; `scratch` needs `n_threads * ctx` floats.
 #[allow(clippy::too_many_arguments)]
-pub fn attention_rows(
-    pool: &Pool,
-    out: &mut [f32],
-    q: &[f32],
-    k_cache: &[f32],
-    v_cache: &[f32],
-    scratch: &mut [f32],
-    d: &Dims,
-    ctx: usize,
-    layer: usize,
-    pos0: usize,
-    m: usize,
-) {
+pub fn attention_rows(pool: &Pool, out: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32], scratch: &mut [f32], d: &Dims, ctx: usize, layer: usize, pos0: usize, m: usize) {
     let hd = d.head_dim;
     let kv = d.kv_dim();
     let qd = d.q_dim();

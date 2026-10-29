@@ -1,8 +1,8 @@
 //! Serialises the GGUF vocabulary into the runtime's zero-copy tokenizer
 //! blob (format documented in `aot-kernels/src/tokenizer.rs`).
 
-use aot_gguf::{GgufFile, MetaValue};
 use anyhow::{bail, Context, Result};
+use aot_gguf::{GgufFile, MetaValue};
 use std::collections::HashMap;
 
 // Mirror of the runtime constants (kept in sync by `tests/blob_roundtrip.rs`).
@@ -14,6 +14,7 @@ pub const FLAG_ADD_EOS: u32 = 1 << 1;
 pub const FLAG_ADD_SPACE_PREFIX: u32 = 1 << 2;
 pub const FLAG_PRE_LLAMA3: u32 = 1 << 3;
 pub const FLAG_IGNORE_MERGES: u32 = 1 << 4;
+pub const FLAG_PRE_QWEN2: u32 = 1 << 5;
 pub const TTYPE_NORMAL: u8 = 1;
 pub const TTYPE_CONTROL: u8 = 3;
 pub const TTYPE_USER_DEFINED: u8 = 4;
@@ -27,6 +28,9 @@ pub mod chat_format {
     pub const LLAMA2: u32 = 4;
     pub const GEMMA: u32 = 5;
     pub const MISTRAL: u32 = 6;
+    pub const QWEN3: u32 = 7;
+    /// Phi-3: `<|user|>` / `<|assistant|>` turns closed by `<|end|>`.
+    pub const PHI3: u32 = 8;
 }
 
 const HDR_SIZE: usize = 128;
@@ -55,15 +59,14 @@ pub fn chat_format_name(f: u32) -> &'static str {
         chat_format::LLAMA2 => "llama2",
         chat_format::GEMMA => "gemma",
         chat_format::MISTRAL => "mistral",
+        chat_format::QWEN3 => "qwen3",
+        chat_format::PHI3 => "phi3",
         _ => "none",
     }
 }
 
 fn strings<'a>(g: &'a GgufFile, key: &str) -> Result<Vec<&'a str>> {
-    g.get_array(key)?
-        .iter()
-        .map(|v| v.as_str().with_context(|| format!("{key}: non-string element")))
-        .collect()
+    g.get_array(key)?.iter().map(|v| v.as_str().with_context(|| format!("{key}: non-string element"))).collect()
 }
 
 fn opt_u32(g: &GgufFile, key: &str) -> Option<u32> {
@@ -77,10 +80,12 @@ fn detect_chat_format(template: Option<&str>, has_token: &dyn Fn(&str) -> bool) 
             return chat_format::LLAMA3;
         }
         if t.contains("<|im_start|>") {
-            return chat_format::CHATML;
+            // Qwen3's template has a thinking switch (enable_thinking).
+            return if t.contains("enable_thinking") { chat_format::QWEN3 } else { chat_format::CHATML };
         }
         if t.contains("<|user|>") {
-            return chat_format::ZEPHYR;
+            // Phi-3 closes turns with <|end|>, Zephyr with </s>.
+            return if t.contains("<|end|>") { chat_format::PHI3 } else { chat_format::ZEPHYR };
         }
         if t.contains("<start_of_turn>") {
             return chat_format::GEMMA;
@@ -96,7 +101,7 @@ fn detect_chat_format(template: Option<&str>, has_token: &dyn Fn(&str) -> bool) 
         return chat_format::CHATML;
     }
     if has_token("<|user|>") {
-        return chat_format::ZEPHYR;
+        return if has_token("<|end|>") { chat_format::PHI3 } else { chat_format::ZEPHYR };
     }
     chat_format::NONE
 }
@@ -171,6 +176,7 @@ pub fn build_blob(g: &GgufFile) -> Result<(Vec<u8>, TokenizerSummary)> {
     if kind == KIND_BPE {
         match pre.as_str() {
             "llama-bpe" | "llama3" | "llama-v3" => flags |= FLAG_PRE_LLAMA3 | FLAG_IGNORE_MERGES,
+            "qwen2" => flags |= FLAG_PRE_QWEN2,
             "default" | "gpt-2" | "gpt2" | "olmo" | "jina-v2-en" | "smollm" => {}
             other => {
                 warnings.push(format!("pre-tokenizer \"{other}\" is not implemented; using the GPT-2 regex (tokenization may differ)"));
@@ -190,8 +196,7 @@ pub fn build_blob(g: &GgufFile) -> Result<(Vec<u8>, TokenizerSummary)> {
     let eos = opt_u32(g, "tokenizer.ggml.eos_token_id").or(if kind == KIND_SPM { Some(2) } else { None });
     let unk = opt_u32(g, "tokenizer.ggml.unknown_token_id").or(if kind == KIND_SPM { Some(0) } else { None });
     let pad = opt_u32(g, "tokenizer.ggml.padding_token_id");
-    let eot = opt_u32(g, "tokenizer.ggml.eot_token_id")
-        .or_else(|| ["<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>", "<|endoftext|>"].iter().find_map(|s| find(s)));
+    let eot = opt_u32(g, "tokenizer.ggml.eot_token_id").or_else(|| ["<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>", "<|endoftext|>"].iter().find_map(|s| find(s)));
     let eom = opt_u32(g, "tokenizer.ggml.eom_token_id").or_else(|| find("<|eom_id|>"));
     for (name, id) in [("bos", bos), ("eos", eos), ("unk", unk), ("pad", pad), ("eot", eot), ("eom", eom)] {
         if let Some(i) = id {
@@ -265,9 +270,7 @@ pub fn build_blob(g: &GgufFile) -> Result<(Vec<u8>, TokenizerSummary)> {
     }
 
     // Special tokens, longest text first for greedy matching.
-    let mut special: Vec<u32> = (0..n as u32)
-        .filter(|&i| matches!(types[i as usize], TTYPE_CONTROL | TTYPE_USER_DEFINED) && !tokens[i as usize].is_empty())
-        .collect();
+    let mut special: Vec<u32> = (0..n as u32).filter(|&i| matches!(types[i as usize], TTYPE_CONTROL | TTYPE_USER_DEFINED) && !tokens[i as usize].is_empty()).collect();
     special.sort_unstable_by(|&a, &b| tokens[b as usize].len().cmp(&tokens[a as usize].len()).then(a.cmp(&b)));
 
     let template = g.get_str("tokenizer.chat_template").ok();
@@ -325,19 +328,7 @@ pub fn build_blob(g: &GgufFile) -> Result<(Vec<u8>, TokenizerSummary)> {
     b.set_u32(12, n as u32);
     b.set_u32(96, n_sorted as u32);
 
-    let summary = TokenizerSummary {
-        kind: if kind == KIND_SPM { "spm" } else { "bpe" },
-        pre,
-        n_tokens: n,
-        n_merges: merges.len(),
-        n_special: special.len(),
-        bos,
-        eos,
-        eot,
-        chat_format: chat,
-        stop_tokens: stop,
-        warnings,
-    };
+    let summary = TokenizerSummary { kind: if kind == KIND_SPM { "spm" } else { "bpe" }, pre, n_tokens: n, n_merges: merges.len(), n_special: special.len(), bos, eos, eot, chat_format: chat, stop_tokens: stop, warnings };
     Ok((b.buf, summary))
 }
 

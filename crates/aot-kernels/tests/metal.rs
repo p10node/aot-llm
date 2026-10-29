@@ -61,7 +61,7 @@ fn max_err(got: &[f32], want: &[f64]) -> (f64, f64) {
 #[test]
 fn matmul_every_kind_matches_dequantized_reference() {
     let mut rng = Rng(0xC0FFEE);
-    let kinds = [Kind::F32, Kind::F16, Kind::BF16, Kind::Q4_0, Kind::Q8_0, Kind::Q4_K, Kind::Q5_K, Kind::Q6_K];
+    let kinds = [Kind::F32, Kind::F16, Kind::BF16, Kind::Q4_0, Kind::Q5_0, Kind::Q8_0, Kind::Q4_K, Kind::Q5_K, Kind::Q6_K];
     // (rows, cols): rows not a multiple of 16 (partial simdgroups) and column
     // counts that end inside a lane iteration for every block size.
     // Row counts also cover the 1 / 2 / 4 rows-per-simdgroup kernels.
@@ -190,7 +190,7 @@ fn rmsnorm_rope_silu_match_cpu_ops() {
 fn fused_decode_kernels_match_separate_ops() {
     let mut rng = Rng(0xF00D);
     let d = Dims { dim: 512, hidden: 1024, n_layer: 1, n_head: 4, n_kv_head: 2, head_dim: 64, rot_dim: 64, vocab: 16, n_ctx_train: 64, eps: 1e-5, rope_base: 10000.0, rope_scale: 1.0 };
-    for kind in [Kind::Q4_K, Kind::Q6_K, Kind::Q4_0, Kind::F16] {
+    for kind in [Kind::Q4_K, Kind::Q6_K, Kind::Q4_0, Kind::Q5_0, Kind::F16] {
         let mut blob = Vec::new();
         let mut mk = |rng: &mut Rng, rows: usize, cols: usize| -> Tensor {
             while blob.len() % 32 != 0 {
@@ -243,7 +243,6 @@ fn fused_decode_kernels_match_separate_ops() {
         eprintln!("{}: fused rope q err {eq:.2e} k err {ek:.2e}; fused gate err {eh:.2e} (max {sh:.2})", kind.name());
         assert!(eq <= 1e-5 * sq + 1e-6 && ek <= 1e-5 * sk + 1e-6, "{}: fused rope differs", kind.name());
         assert!(eh <= 1e-5 * sh + 1e-6, "{}: fused gate differs", kind.name());
-
     }
 }
 

@@ -155,7 +155,17 @@ fn compile(
     let d = &spec.dims;
     eprintln!(
         "      {} | {} | {:.3}B params | {} | dim {} hidden {} layers {} heads {}/{} vocab {} ctx {}",
-        spec.name, spec.arch, spec.n_params as f64 / 1e9, spec.file_type, d.dim, d.hidden, d.n_layer, d.n_head, d.n_kv_head, d.vocab, d.n_ctx_train
+        spec.name,
+        spec.arch,
+        spec.n_params as f64 / 1e9,
+        spec.file_type,
+        d.dim,
+        d.hidden,
+        d.n_layer,
+        d.n_head,
+        d.n_kv_head,
+        d.vocab,
+        d.n_ctx_train
     );
     eprintln!("      quantization: {} | weights {}", spec.quant_mix, human(spec.data_len));
     for w in &spec.warnings {
@@ -295,7 +305,21 @@ fn inspect(model: &Path, tensors: bool, metadata: bool) -> Result<()> {
         Ok(spec) => {
             let d = &spec.dims;
             println!("model:       {} ({}, {})", spec.name, spec.arch, spec.file_type);
-            println!("dims:        dim {} hidden {} layers {} heads {} kv {} head_dim {} rot {} vocab {} ctx {} eps {} rope {}{}", d.dim, d.hidden, d.n_layer, d.n_head, d.n_kv_head, d.head_dim, d.rot_dim, d.vocab, d.n_ctx_train, d.eps, d.rope_base, if spec.rope_freqs.is_some() { " (+freq factors)" } else { "" });
+            println!(
+                "dims:        dim {} hidden {} layers {} heads {} kv {} head_dim {} rot {} vocab {} ctx {} eps {} rope {}{}",
+                d.dim,
+                d.hidden,
+                d.n_layer,
+                d.n_head,
+                d.n_kv_head,
+                d.head_dim,
+                d.rot_dim,
+                d.vocab,
+                d.n_ctx_train,
+                d.eps,
+                d.rope_base,
+                if spec.rope_freqs.is_some() { " (+freq factors)" } else { "" }
+            );
             println!("output head: {}", if spec.output.is_some() { "separate" } else { "tied to token_embd" });
             for w in &spec.warnings {
                 println!("warning:     {w}");
@@ -306,7 +330,17 @@ fn inspect(model: &Path, tensors: bool, metadata: bool) -> Result<()> {
     match build_blob(&g) {
         Ok((blob, t)) => println!(
             "tokenizer:   {} ({}) {} tokens, {} merges, {} special, bos={:?} eos={:?} eot={:?}, stop={:?}, chat={}, blob {}",
-            t.kind, t.pre, t.n_tokens, t.n_merges, t.n_special, t.bos, t.eos, t.eot, t.stop_tokens, chat_format_name(t.chat_format), human(blob.len() as u64)
+            t.kind,
+            t.pre,
+            t.n_tokens,
+            t.n_merges,
+            t.n_special,
+            t.bos,
+            t.eos,
+            t.eot,
+            t.stop_tokens,
+            chat_format_name(t.chat_format),
+            human(blob.len() as u64)
         ),
         Err(e) => println!("tokenizer:   unsupported: {e:#}"),
     }

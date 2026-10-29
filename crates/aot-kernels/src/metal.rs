@@ -228,9 +228,7 @@ pub enum BufId {
 const N_BUFS: usize = 21;
 
 fn state_bufs(s: &State) -> [&Buf<f32>; N_BUFS] {
-    [
-        &s.x, &s.xb, &s.xb2, &s.q, &s.k, &s.v, &s.hb, &s.hb2, &s.logits, &s.k_cache, &s.v_cache, &s.rope_cs, &s.bx, &s.bxb, &s.bxb2, &s.bq, &s.bk, &s.bv, &s.bhb, &s.bhb2, &s.brope_cs,
-    ]
+    [&s.x, &s.xb, &s.xb2, &s.q, &s.k, &s.v, &s.hb, &s.hb2, &s.logits, &s.k_cache, &s.v_cache, &s.rope_cs, &s.bx, &s.bxb, &s.bxb2, &s.bq, &s.bk, &s.bv, &s.bhb, &s.bhb2, &s.brope_cs]
 }
 
 /// Index of a weight format in the pipeline tables (matches `KIND_NAMES`).
@@ -244,9 +242,11 @@ fn kind_idx(k: Kind) -> usize {
         Kind::Q4_K => 5,
         Kind::Q5_K => 6,
         Kind::Q6_K => 7,
+        Kind::Q5_0 => 8,
     }
 }
-const KIND_NAMES: [&str; 8] = ["f32", "f16", "bf16", "q4_0", "q8_0", "q4_k", "q5_k", "q6_k"];
+const N_KINDS: usize = 9;
+const KIND_NAMES: [&str; N_KINDS] = ["f32", "f16", "bf16", "q4_0", "q8_0", "q4_k", "q5_k", "q6_k", "q5_0"];
 
 // Argument blocks, laid out exactly like the structs in `shaders.metal`.
 #[repr(C)]
@@ -260,16 +260,20 @@ struct MmArgs {
     rope: u32,
     head_dim: u32,
     rot_dim: u32,
+    bias: u32,
 }
 
 /// Fusions available on a matrix-vector product (decode step); see
 /// `kernel_mv` in `shaders.metal`.
 #[derive(Clone, Copy, Default)]
-pub struct MvOpts {
+pub struct MvOpts<'a> {
     /// `dst += W x` instead of `dst = W x` (residual connections).
     pub accumulate: bool,
-    /// Rotate the output pairs with this (cos, sin) row (q / k projections).
+    /// Rotate the output pairs with this (cos, sin) row (q / k projections,
+    /// adjacent-pair layout only; NEOX models use [`Gpu::rope_ex`]).
     pub rope: Option<BufId>,
+    /// Add this f32 vector (one value per output row) to the result.
+    pub bias: Option<&'a Tensor>,
 }
 #[repr(C)]
 struct NormArgs {
@@ -286,6 +290,7 @@ struct RopeArgs {
     rot_dim: u32,
     q_stride: u32,
     k_stride: u32,
+    neox: u32,
 }
 #[repr(C)]
 struct AttnArgs {
@@ -312,9 +317,9 @@ pub struct Gpu {
     device: Id,
     queue: Id,
     /// Matrix-vector kernels per format, for 1, 2, 4 and 8 rows per simdgroup.
-    pso_mv: [[Id; 4]; 8],
-    pso_mm: [Id; 8],
-    pso_gate: [Id; 8],
+    pso_mv: [[Id; 4]; N_KINDS],
+    pso_mm: [Id; N_KINDS],
+    pso_gate: [Id; N_KINDS],
     pso_rmsnorm: Id,
     pso_rope: Id,
     pso_attention: Id,
@@ -386,12 +391,7 @@ impl Gpu {
     }
 
     #[allow(clippy::type_complexity)]
-    unsafe fn init(
-        o: &Objc,
-        copy_all_devices: unsafe extern "C" fn() -> Id,
-        weights: &'static [u8],
-        state: &State,
-    ) -> Result<(Id, Id, String, ([[Id; 4]; 8], [Id; 8], [Id; 8], Id, Id, Id, Id), Id, [Id; N_BUFS]), String> {
+    unsafe fn init(o: &Objc, copy_all_devices: unsafe extern "C" fn() -> Id, weights: &'static [u8], state: &State) -> Result<(Id, Id, String, ([[Id; 4]; N_KINDS], [Id; N_KINDS], [Id; N_KINDS], Id, Id, Id, Id), Id, [Id; N_BUFS]), String> {
         // MTLCopyAllDevices is several times faster than
         // MTLCreateSystemDefaultDevice (which talks to the window server).
         let devices = copy_all_devices();
@@ -427,9 +427,9 @@ impl Gpu {
             }
             Ok(p)
         };
-        let mut pso_mv = [[null_mut(); 4]; 8];
-        let mut pso_mm = [null_mut(); 8];
-        let mut pso_gate = [null_mut(); 8];
+        let mut pso_mv = [[null_mut(); 4]; N_KINDS];
+        let mut pso_mm = [null_mut(); N_KINDS];
+        let mut pso_gate = [null_mut(); N_KINDS];
         for (i, n) in KIND_NAMES.iter().enumerate() {
             for (j, nr) in [1, 2, 4, 8].iter().enumerate() {
                 pso_mv[i][j] = pipeline(&format!("mv{nr}_{n}"))?;
@@ -514,13 +514,21 @@ impl Gpu {
     /// `dst[t] = src[t] / rms(src[t]) * w` for `m` rows of `n` floats; `src`
     /// starts at element `src_off`.
     pub fn rmsnorm(&mut self, dst: BufId, src: BufId, src_off: usize, w: &Tensor, n: usize, m: usize, eps: f32) {
+        self.rmsnorm_at(dst, 0, src, src_off, w, n, m, eps);
+    }
+
+    /// [`Gpu::rmsnorm`] writing from element `dst_off`. `dst == src` with
+    /// equal offsets normalises in place (each element is read and written
+    /// by the same thread), which is how the per-head q / k norms of Qwen3
+    /// run: `n = head_dim`, `m = n_heads`.
+    pub fn rmsnorm_at(&mut self, dst: BufId, dst_off: usize, src: BufId, src_off: usize, w: &Tensor, n: usize, m: usize, eps: f32) {
         debug_assert_eq!(w.kind, Kind::F32);
         let args = NormArgs { n: n as u32, m: m as u32, eps };
         unsafe {
             self.set_pipeline(self.pso_rmsnorm);
             self.set_buf(self.bufs[src as usize], src_off * 4, 0);
             self.set_buf(self.wbuf, w.off, 1);
-            self.set_buf(self.bufs[dst as usize], 0, 2);
+            self.set_buf(self.bufs[dst as usize], dst_off * 4, 2);
             self.set_args(&args, 3);
             self.dispatch(m, 1, 256);
         }
@@ -530,10 +538,15 @@ impl Gpu {
     /// `w.cols` floats (packed back to back from element `src_off`) into `m`
     /// output vectors of `w.rows` floats from element `dst_off`.
     pub fn matmul(&mut self, dst: BufId, dst_off: usize, w: &Tensor, src: BufId, src_off: usize, m: usize, accumulate: bool) {
+        self.matmul_bias(dst, dst_off, w, src, src_off, m, accumulate, None);
+    }
+
+    /// [`Gpu::matmul`] with an optional bias vector added to every output row.
+    pub fn matmul_bias(&mut self, dst: BufId, dst_off: usize, w: &Tensor, src: BufId, src_off: usize, m: usize, accumulate: bool, bias: Option<&Tensor>) {
         if m == 1 {
-            self.mv(dst, dst_off, w, src, src_off, None, MvOpts { accumulate, ..MvOpts::default() });
+            self.mv(dst, dst_off, w, src, src_off, None, MvOpts { accumulate, bias, ..MvOpts::default() });
         } else {
-            self.mm(dst, dst_off, w, src, src_off, m, accumulate);
+            self.mm(dst, dst_off, w, src, src_off, m, accumulate, bias);
         }
     }
 
@@ -586,7 +599,11 @@ impl Gpu {
             rope: opts.rope.is_some() as u32,
             head_dim,
             rot_dim,
+            bias: opts.bias.is_some() as u32,
         };
+        if let Some(b) = opts.bias {
+            debug_assert!(b.kind == Kind::F32 && b.rows * b.cols >= w.rows, "bias must be f32 with one value per output row");
+        }
         unsafe {
             self.set_pipeline(self.pso_mv[k][nr.trailing_zeros() as usize]);
             self.set_buf(self.wbuf, w.off, 0);
@@ -594,23 +611,14 @@ impl Gpu {
             self.set_buf(self.bufs[dst as usize], dst_off * 4, 2);
             self.set_args(&args, 3);
             self.set_buf(self.bufs[opts.rope.unwrap_or(src) as usize], 0, 4);
+            self.set_buf(self.wbuf, opts.bias.map(|b| b.off).unwrap_or(0), 5);
             self.dispatch(groups, 1, MM_THREADS);
         }
     }
 
     /// Batched product (see [`Gpu::matmul`]), `m >= 2`.
-    fn mm(&mut self, dst: BufId, dst_off: usize, w: &Tensor, src: BufId, src_off: usize, m: usize, accumulate: bool) {
-        let args = MmArgs {
-            rows: w.rows as u32,
-            cols: w.cols as u32,
-            m: m as u32,
-            accumulate: accumulate as u32,
-            x_stride: w.cols as u32,
-            y_stride: w.rows as u32,
-            rope: 0,
-            head_dim: 1,
-            rot_dim: 0,
-        };
+    fn mm(&mut self, dst: BufId, dst_off: usize, w: &Tensor, src: BufId, src_off: usize, m: usize, accumulate: bool, bias: Option<&Tensor>) {
+        let args = MmArgs { rows: w.rows as u32, cols: w.cols as u32, m: m as u32, accumulate: accumulate as u32, x_stride: w.cols as u32, y_stride: w.rows as u32, rope: 0, head_dim: 1, rot_dim: 0, bias: bias.is_some() as u32 };
         debug_assert!(w.cols.is_multiple_of(MM_TILE), "batched product needs a column count that is a multiple of 32");
         unsafe {
             self.set_pipeline(self.pso_mm[kind_idx(w.kind)]);
@@ -618,6 +626,7 @@ impl Gpu {
             self.set_buf(self.bufs[src as usize], src_off * 4, 1);
             self.set_buf(self.bufs[dst as usize], dst_off * 4, 2);
             self.set_args(&args, 3);
+            self.set_buf(self.wbuf, bias.map(|b| b.off).unwrap_or(0), 4);
             self.dispatch(w.rows.div_ceil(MM_TILE), m.div_ceil(MM_TILE), MM_THREADS);
         }
     }
@@ -627,7 +636,7 @@ impl Gpu {
     /// matrices must have the same format and shape.
     pub fn gate_up_silu(&mut self, dst: BufId, gate: &Tensor, up: &Tensor, src: BufId) {
         debug_assert!(gate.kind == up.kind && gate.rows == up.rows && gate.cols == up.cols);
-        let args = MmArgs { rows: gate.rows as u32, cols: gate.cols as u32, m: 1, accumulate: 0, x_stride: gate.cols as u32, y_stride: gate.rows as u32, rope: 0, head_dim: 1, rot_dim: 0 };
+        let args = MmArgs { rows: gate.rows as u32, cols: gate.cols as u32, m: 1, accumulate: 0, x_stride: gate.cols as u32, y_stride: gate.rows as u32, rope: 0, head_dim: 1, rot_dim: 0, bias: 0 };
         unsafe {
             self.set_pipeline(self.pso_gate[kind_idx(gate.kind)]);
             self.set_buf(self.wbuf, gate.off, 0);
@@ -643,15 +652,13 @@ impl Gpu {
     /// `k` (from element `k_off`, rows `kv_dim` apart) with the (cos, sin)
     /// rows of `cs`.
     pub fn rope(&mut self, q: BufId, k: BufId, k_off: usize, m: usize, cs: BufId, d: &Dims) {
-        let args = RopeArgs {
-            m: m as u32,
-            n_head: d.n_head as u32,
-            n_kv_head: d.n_kv_head as u32,
-            head_dim: d.head_dim as u32,
-            rot_dim: d.rot_dim as u32,
-            q_stride: d.q_dim() as u32,
-            k_stride: d.kv_dim() as u32,
-        };
+        self.rope_ex(q, k, k_off, m, cs, d, false);
+    }
+
+    /// [`Gpu::rope`] with a choice of pair layout: `neox` rotates
+    /// `(i, i + rot_dim / 2)` (Qwen2 / Qwen3) instead of adjacent elements.
+    pub fn rope_ex(&mut self, q: BufId, k: BufId, k_off: usize, m: usize, cs: BufId, d: &Dims, neox: bool) {
+        let args = RopeArgs { m: m as u32, n_head: d.n_head as u32, n_kv_head: d.n_kv_head as u32, head_dim: d.head_dim as u32, rot_dim: d.rot_dim as u32, q_stride: d.q_dim() as u32, k_stride: d.kv_dim() as u32, neox: neox as u32 };
         let total = m * (d.n_head + d.n_kv_head) * (d.rot_dim / 2);
         unsafe {
             self.set_pipeline(self.pso_rope);

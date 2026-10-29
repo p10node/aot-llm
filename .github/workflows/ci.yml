@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64 (AVX2 kernels, Linux) and Apple Silicon (NEON + Metal).
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Unit and kernel tests
+        run: cargo test --workspace --release --exclude aot-llm
+      - name: End-to-end (compile tiny models, compare logits)
+        # Builds a generated project per architecture, so the Rust toolchain
+        # must be usable from a subprocess (it is on the hosted runners).
+        run: cargo test -p aot-llm --release -- --nocapture
+
+  cross:
+    name: cross-build static Linux binary
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the compiler
+        run: cargo build --release
+      - name: Generate a tiny model and cross-compile it
+        run: |
+          cargo test -p aot-llm --release -- --nocapture llama_compile_run_and_match_reference
+          GGUF=$(find target -name tiny.gguf -path '*e2e-llama*' | head -1)
+          ./target/release/aot-llm compile --model "$GGUF" --output ./tiny_linux --target x86_64-unknown-linux-musl --quiet
+          file ./tiny_linux
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, cross]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: aot-llm-x86_64-linux
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: aot-llm-aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: |
+          mkdir -p dist
+          cp target/release/aot-llm dist/${{ matrix.name }}
+          cd dist && shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

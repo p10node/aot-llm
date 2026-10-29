@@ -42,6 +42,8 @@ pub const FLAG_ADD_EOS: u32 = 1 << 1;
 pub const FLAG_ADD_SPACE_PREFIX: u32 = 1 << 2;
 pub const FLAG_PRE_LLAMA3: u32 = 1 << 3;
 pub const FLAG_IGNORE_MERGES: u32 = 1 << 4;
+/// Qwen2 pre-tokenizer: the Llama-3 regex with single-digit numbers.
+pub const FLAG_PRE_QWEN2: u32 = 1 << 5;
 
 /// Header field offsets.
 pub mod hdr {
@@ -94,6 +96,11 @@ pub mod chat_format {
     pub const LLAMA2: u32 = 4;
     pub const GEMMA: u32 = 5;
     pub const MISTRAL: u32 = 6;
+    /// ChatML with Qwen3's thinking switch (an empty `<think>` block opens
+    /// the assistant turn so the model answers directly).
+    pub const QWEN3: u32 = 7;
+    /// Phi-3: `<|user|>` / `<|assistant|>` turns closed by `<|end|>`.
+    pub const PHI3: u32 = 8;
 }
 
 /// SentencePiece's visible space marker.
@@ -418,6 +425,8 @@ impl Tokenizer {
         let mut words = Vec::new();
         if self.flags() & FLAG_PRE_LLAMA3 != 0 {
             pretokenize_llama3(s, &mut words);
+        } else if self.flags() & FLAG_PRE_QWEN2 != 0 {
+            pretokenize_qwen2(s, &mut words);
         } else {
             pretokenize_gpt2(s, &mut words);
         }
@@ -720,6 +729,16 @@ fn match_contraction(chars: &[(usize, char)], i: usize, ci: bool) -> Option<usiz
 /// Llama-3 pre-tokenizer:
 /// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
 pub fn pretokenize_llama3(s: &str, out: &mut Vec<(usize, usize)>) {
+    pretokenize_llama3_like(s, out, 3);
+}
+
+/// Qwen2 / Qwen2.5 / Qwen3 pre-tokenizer: the Llama-3 regex with `\p{N}`
+/// (every digit on its own) instead of `\p{N}{1,3}`.
+pub fn pretokenize_qwen2(s: &str, out: &mut Vec<(usize, usize)>) {
+    pretokenize_llama3_like(s, out, 1);
+}
+
+fn pretokenize_llama3_like(s: &str, out: &mut Vec<(usize, usize)>, max_digits: usize) {
     let chars: Vec<(usize, char)> = s.char_indices().collect();
     let n = chars.len();
     let end_of = |k: usize| if k < n { chars[k].0 } else { s.len() };
@@ -748,10 +767,10 @@ pub fn pretokenize_llama3(s: &str, out: &mut Vec<(usize, usize)>) {
                 continue;
             }
         }
-        // \p{N}{1,3}
+        // \p{N}{1,3} (Llama 3) or \p{N} (Qwen2)
         if is_number(c) {
             let mut j = i;
-            while j < n && j - i < 3 && is_number(chars[j].1) {
+            while j < n && j - i < max_digits && is_number(chars[j].1) {
                 j += 1;
             }
             out.push((start, end_of(j)));
@@ -886,6 +905,14 @@ mod tests {
         assert_eq!(pieces(pretokenize_llama3, "end.\n"), vec!["end", ".\n"]);
         assert_eq!(pieces(pretokenize_llama3, "  "), vec!["  "]);
         assert_eq!(pieces(pretokenize_llama3, "Xin chào thế giới"), vec!["Xin", " chào", " thế", " giới"]);
+    }
+
+    #[test]
+    fn qwen2_pretokenizer() {
+        assert_eq!(pieces(pretokenize_qwen2, "Hello world"), vec!["Hello", " world"]);
+        assert_eq!(pieces(pretokenize_qwen2, "I'm here, it's 12345!"), vec!["I", "'m", " here", ",", " it", "'s", " ", "1", "2", "3", "4", "5", "!"]);
+        assert_eq!(pieces(pretokenize_qwen2, "x\n\n  y"), vec!["x", "\n\n", " ", " y"]);
+        assert_eq!(pieces(pretokenize_qwen2, "Xin chào 2026"), vec!["Xin", " chào", " ", "2", "0", "2", "6"]);
     }
 
     #[test]

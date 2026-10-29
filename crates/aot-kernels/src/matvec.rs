@@ -46,6 +46,25 @@ pub mod scalar {
         sum
     }
 
+    pub fn dot_q5_0_q8_0(w: &[u8], x: &[BlockQ8_0]) -> f32 {
+        let mut sum = 0f32;
+        for (i, xb) in x.iter().enumerate() {
+            let b = &w[i * Q5_0_SIZE..(i + 1) * Q5_0_SIZE];
+            let d = read_f16(b, 0);
+            let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+            let mut s = 0i32;
+            for j in 0..16 {
+                let q = b[6 + j];
+                let lo = ((q & 0x0F) as u32 | (((qh >> j) & 1) << 4)) as i32 - 16;
+                let hi = ((q >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4)) as i32 - 16;
+                s += lo * xb.qs[j] as i32;
+                s += hi * xb.qs[j + 16] as i32;
+            }
+            sum += s as f32 * d * xb.d;
+        }
+        sum
+    }
+
     pub fn dot_q8_0_q8_0(w: &[u8], x: &[BlockQ8_0]) -> f32 {
         let mut sum = 0f32;
         for (i, xb) in x.iter().enumerate() {
@@ -172,29 +191,37 @@ pub mod scalar {
     }
 }
 
+/// A dot product of one quantized weight row with one activation vector.
+pub type DotFn<T> = fn(&[u8], &[T]) -> f32;
+/// A 1x4 micro-kernel: one weight row against four activation vectors.
+pub type Dot4Fn<T> = fn(&[u8], [&[T]; 4]) -> [f32; 4];
+
 /// Function table of the dot products selected for this CPU.
 #[derive(Clone, Copy)]
 pub struct Kernels {
     pub name: &'static str,
-    pub q4_0_q8_0: fn(&[u8], &[BlockQ8_0]) -> f32,
-    pub q8_0_q8_0: fn(&[u8], &[BlockQ8_0]) -> f32,
-    pub q4_k_q8_k: fn(&[u8], &[BlockQ8_K]) -> f32,
-    pub q5_k_q8_k: fn(&[u8], &[BlockQ8_K]) -> f32,
-    pub q6_k_q8_k: fn(&[u8], &[BlockQ8_K]) -> f32,
-    pub f16_f32: fn(&[u8], &[f32]) -> f32,
-    pub bf16_f32: fn(&[u8], &[f32]) -> f32,
-    pub f32_f32: fn(&[u8], &[f32]) -> f32,
+    pub q4_0_q8_0: DotFn<BlockQ8_0>,
+    pub q5_0_q8_0: DotFn<BlockQ8_0>,
+    pub q8_0_q8_0: DotFn<BlockQ8_0>,
+    pub q4_k_q8_k: DotFn<BlockQ8_K>,
+    pub q5_k_q8_k: DotFn<BlockQ8_K>,
+    pub q6_k_q8_k: DotFn<BlockQ8_K>,
+    pub f16_f32: DotFn<f32>,
+    pub bf16_f32: DotFn<f32>,
+    pub f32_f32: DotFn<f32>,
     /// Optional 1x4 micro-kernels (one row, four activations) used by the
     /// batched products; `None` falls back to four single dots.
-    pub q4_0_q8_0_x4: Option<fn(&[u8], [&[BlockQ8_0]; 4]) -> [f32; 4]>,
-    pub q8_0_q8_0_x4: Option<fn(&[u8], [&[BlockQ8_0]; 4]) -> [f32; 4]>,
-    pub q4_k_q8_k_x4: Option<fn(&[u8], [&[BlockQ8_K]; 4]) -> [f32; 4]>,
-    pub q6_k_q8_k_x4: Option<fn(&[u8], [&[BlockQ8_K]; 4]) -> [f32; 4]>,
+    pub q4_0_q8_0_x4: Option<Dot4Fn<BlockQ8_0>>,
+    pub q5_0_q8_0_x4: Option<Dot4Fn<BlockQ8_0>>,
+    pub q8_0_q8_0_x4: Option<Dot4Fn<BlockQ8_0>>,
+    pub q4_k_q8_k_x4: Option<Dot4Fn<BlockQ8_K>>,
+    pub q6_k_q8_k_x4: Option<Dot4Fn<BlockQ8_K>>,
 }
 
 pub const SCALAR_KERNELS: Kernels = Kernels {
     name: "scalar",
     q4_0_q8_0: scalar::dot_q4_0_q8_0,
+    q5_0_q8_0: scalar::dot_q5_0_q8_0,
     q8_0_q8_0: scalar::dot_q8_0_q8_0,
     q4_k_q8_k: scalar::dot_q4_k_q8_k,
     q5_k_q8_k: scalar::dot_q5_k_q8_k,
@@ -203,6 +230,7 @@ pub const SCALAR_KERNELS: Kernels = Kernels {
     bf16_f32: scalar::dot_bf16_f32,
     f32_f32: scalar::dot_f32_f32,
     q4_0_q8_0_x4: None,
+    q5_0_q8_0_x4: None,
     q8_0_q8_0_x4: None,
     q4_k_q8_k_x4: None,
     q6_k_q8_k_x4: None,
@@ -220,11 +248,7 @@ pub fn detect_kernels() -> Kernels {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            return if std::is_x86_feature_detected!("f16c") {
-                avx2::KERNELS_F16C
-            } else {
-                avx2::KERNELS
-            };
+            return if std::is_x86_feature_detected!("f16c") { avx2::KERNELS_F16C } else { avx2::KERNELS };
         }
     }
     #[allow(unreachable_code)]
@@ -273,15 +297,7 @@ fn active() -> &'static Kernels {
 
 /// Parallel loop over the rows of a quantized matrix.
 #[inline]
-fn matvec_rows<T: Sync>(
-    pool: &Pool,
-    out: &mut [f32],
-    w: &[u8],
-    x: &[T],
-    rows: usize,
-    row_bytes: usize,
-    dot: fn(&[u8], &[T]) -> f32,
-) {
+fn matvec_rows<T: Sync>(pool: &Pool, out: &mut [f32], w: &[u8], x: &[T], rows: usize, row_bytes: usize, dot: DotFn<T>) {
     assert!(out.len() >= rows, "output too small: {} < {rows}", out.len());
     assert!(w.len() >= rows * row_bytes, "weight slice too small: {} < {}", w.len(), rows * row_bytes);
     let o = SendPtr(out.as_mut_ptr());
@@ -304,15 +320,7 @@ fn row_chunk(rows: usize, nth: usize) -> usize {
 /// Three products sharing one input and one kernel (the q/k/v projections),
 /// issued as a single parallel region over the concatenated row space.
 #[allow(clippy::too_many_arguments)]
-fn matvec3_rows<T: Sync>(
-    pool: &Pool,
-    outs: [&mut [f32]; 3],
-    ws: [&[u8]; 3],
-    x: &[T],
-    rows: [usize; 3],
-    row_bytes: usize,
-    dot: fn(&[u8], &[T]) -> f32,
-) {
+fn matvec3_rows<T: Sync>(pool: &Pool, outs: [&mut [f32]; 3], ws: [&[u8]; 3], x: &[T], rows: [usize; 3], row_bytes: usize, dot: DotFn<T>) {
     for i in 0..3 {
         assert!(outs[i].len() >= rows[i] && ws[i].len() >= rows[i] * row_bytes, "q/k/v buffers too small");
     }
@@ -336,13 +344,13 @@ fn matvec3_rows<T: Sync>(
 
 /// Fused q/k/v projections for K-quant weights of one kind.
 #[allow(clippy::too_many_arguments)]
-pub fn matvec3_q8_k_input(pool: &Pool, outs: [&mut [f32]; 3], ws: [&[u8]; 3], x: &[BlockQ8_K], rows: [usize; 3], row_bytes: usize, dot: fn(&[u8], &[BlockQ8_K]) -> f32) {
+pub fn matvec3_q8_k_input(pool: &Pool, outs: [&mut [f32]; 3], ws: [&[u8]; 3], x: &[BlockQ8_K], rows: [usize; 3], row_bytes: usize, dot: DotFn<BlockQ8_K>) {
     matvec3_rows(pool, outs, ws, x, rows, row_bytes, dot);
 }
 
 /// Fused q/k/v projections for Q4_0 / Q8_0 weights of one kind.
 #[allow(clippy::too_many_arguments)]
-pub fn matvec3_q8_0_input(pool: &Pool, outs: [&mut [f32]; 3], ws: [&[u8]; 3], x: &[BlockQ8_0], rows: [usize; 3], row_bytes: usize, dot: fn(&[u8], &[BlockQ8_0]) -> f32) {
+pub fn matvec3_q8_0_input(pool: &Pool, outs: [&mut [f32]; 3], ws: [&[u8]; 3], x: &[BlockQ8_0], rows: [usize; 3], row_bytes: usize, dot: DotFn<BlockQ8_0>) {
     matvec3_rows(pool, outs, ws, x, rows, row_bytes, dot);
 }
 
@@ -350,6 +358,11 @@ pub fn matvec3_q8_0_input(pool: &Pool, outs: [&mut [f32]; 3], ws: [&[u8]; 3], x:
 pub fn matvec_q4_0(pool: &Pool, out: &mut [f32], w: &[u8], x: &[BlockQ8_0], rows: usize, cols: usize) {
     debug_assert_eq!(x.len(), cols / QK8_0);
     matvec_rows(pool, out, w, x, rows, Kind::Q4_0.row_bytes(cols), active().q4_0_q8_0);
+}
+
+pub fn matvec_q5_0(pool: &Pool, out: &mut [f32], w: &[u8], x: &[BlockQ8_0], rows: usize, cols: usize) {
+    debug_assert_eq!(x.len(), cols / QK8_0);
+    matvec_rows(pool, out, w, x, rows, Kind::Q5_0.row_bytes(cols), active().q5_0_q8_0);
 }
 
 pub fn matvec_q8_0(pool: &Pool, out: &mut [f32], w: &[u8], x: &[BlockQ8_0], rows: usize, cols: usize) {
@@ -391,17 +404,7 @@ pub fn matvec_f32(pool: &Pool, out: &mut [f32], w: &[u8], x: &[f32], rows: usize
 /// parallel region (used for the gate/up projections of the feed-forward
 /// block). Both matrices must have the same kind and shape.
 #[allow(clippy::too_many_arguments)]
-pub fn matvec2_q8_k_input(
-    pool: &Pool,
-    out_a: &mut [f32],
-    out_b: &mut [f32],
-    w_a: &[u8],
-    w_b: &[u8],
-    x: &[BlockQ8_K],
-    rows: usize,
-    row_bytes: usize,
-    dot: fn(&[u8], &[BlockQ8_K]) -> f32,
-) {
+pub fn matvec2_q8_k_input(pool: &Pool, out_a: &mut [f32], out_b: &mut [f32], w_a: &[u8], w_b: &[u8], x: &[BlockQ8_K], rows: usize, row_bytes: usize, dot: DotFn<BlockQ8_K>) {
     assert!(out_a.len() >= rows && out_b.len() >= rows);
     assert!(w_a.len() >= rows * row_bytes && w_b.len() >= rows * row_bytes);
     let oa = SendPtr(out_a.as_mut_ptr());
@@ -419,17 +422,7 @@ pub fn matvec2_q8_k_input(
 
 /// Same as [`matvec2_q8_k_input`] for Q8_0-quantized inputs.
 #[allow(clippy::too_many_arguments)]
-pub fn matvec2_q8_0_input(
-    pool: &Pool,
-    out_a: &mut [f32],
-    out_b: &mut [f32],
-    w_a: &[u8],
-    w_b: &[u8],
-    x: &[BlockQ8_0],
-    rows: usize,
-    row_bytes: usize,
-    dot: fn(&[u8], &[BlockQ8_0]) -> f32,
-) {
+pub fn matvec2_q8_0_input(pool: &Pool, out_a: &mut [f32], out_b: &mut [f32], w_a: &[u8], w_b: &[u8], x: &[BlockQ8_0], rows: usize, row_bytes: usize, dot: DotFn<BlockQ8_0>) {
     assert!(out_a.len() >= rows && out_b.len() >= rows);
     assert!(w_a.len() >= rows * row_bytes && w_b.len() >= rows * row_bytes);
     let oa = SendPtr(out_a.as_mut_ptr());
@@ -446,7 +439,7 @@ pub fn matvec2_q8_0_input(
 }
 
 /// Dot-product function for `kind` with a Q8_K input.
-pub fn dot_fn_q8_k(kind: Kind) -> fn(&[u8], &[BlockQ8_K]) -> f32 {
+pub fn dot_fn_q8_k(kind: Kind) -> DotFn<BlockQ8_K> {
     let k = active();
     match kind {
         Kind::Q4_K => k.q4_k_q8_k,
@@ -457,10 +450,11 @@ pub fn dot_fn_q8_k(kind: Kind) -> fn(&[u8], &[BlockQ8_K]) -> f32 {
 }
 
 /// Dot-product function for `kind` with a Q8_0 input.
-pub fn dot_fn_q8_0(kind: Kind) -> fn(&[u8], &[BlockQ8_0]) -> f32 {
+pub fn dot_fn_q8_0(kind: Kind) -> DotFn<BlockQ8_0> {
     let k = active();
     match kind {
         Kind::Q4_0 => k.q4_0_q8_0,
+        Kind::Q5_0 => k.q5_0_q8_0,
         Kind::Q8_0 => k.q8_0_q8_0,
         _ => panic!("{} is not a Q8_0-input quant", kind.name()),
     }
@@ -482,18 +476,7 @@ const ROW_BLOCK: usize = 8;
 /// once per batch, which turns prompt processing from memory-bound into
 /// compute-bound.
 #[allow(clippy::too_many_arguments)]
-fn matmul_rows<T: Sync>(
-    pool: &Pool,
-    out: &mut [f32],
-    w: &[u8],
-    xs: &[T],
-    m: usize,
-    nb: usize,
-    rows: usize,
-    row_bytes: usize,
-    dot: fn(&[u8], &[T]) -> f32,
-    dot4: Option<fn(&[u8], [&[T]; 4]) -> [f32; 4]>,
-) {
+fn matmul_rows<T: Sync>(pool: &Pool, out: &mut [f32], w: &[u8], xs: &[T], m: usize, nb: usize, rows: usize, row_bytes: usize, dot: DotFn<T>, dot4: Option<Dot4Fn<T>>) {
     assert!(out.len() >= m * rows, "output too small: {} < {}", out.len(), m * rows);
     assert!(w.len() >= rows * row_bytes, "weight slice too small");
     assert!(xs.len() >= m * nb, "input slice too small: {} < {}", xs.len(), m * nb);
@@ -549,6 +532,7 @@ macro_rules! matmul_fns {
 
 matmul_fns! {
     matmul_q4_0, Kind::Q4_0, q4_0_q8_0, |k: &Kernels| k.q4_0_q8_0_x4, BlockQ8_0, QK8_0;
+    matmul_q5_0, Kind::Q5_0, q5_0_q8_0, |k: &Kernels| k.q5_0_q8_0_x4, BlockQ8_0, QK8_0;
     matmul_q8_0, Kind::Q8_0, q8_0_q8_0, |k: &Kernels| k.q8_0_q8_0_x4, BlockQ8_0, QK8_0;
     matmul_q4_k, Kind::Q4_K, q4_k_q8_k, |k: &Kernels| k.q4_k_q8_k_x4, BlockQ8_K, QK_K;
     matmul_q5_k, Kind::Q5_K, q5_k_q8_k, |_k: &Kernels| None, BlockQ8_K, QK_K;
@@ -559,7 +543,7 @@ matmul_fns! {
 }
 
 /// 1x4 micro-kernel for `kind` with a Q8_K input, if available.
-pub fn dot4_fn_q8_k(kind: Kind) -> Option<fn(&[u8], [&[BlockQ8_K]; 4]) -> [f32; 4]> {
+pub fn dot4_fn_q8_k(kind: Kind) -> Option<Dot4Fn<BlockQ8_K>> {
     let k = active();
     match kind {
         Kind::Q4_K => k.q4_k_q8_k_x4,
@@ -569,10 +553,11 @@ pub fn dot4_fn_q8_k(kind: Kind) -> Option<fn(&[u8], [&[BlockQ8_K]; 4]) -> [f32; 
 }
 
 /// 1x4 micro-kernel for `kind` with a Q8_0 input, if available.
-pub fn dot4_fn_q8_0(kind: Kind) -> Option<fn(&[u8], [&[BlockQ8_0]; 4]) -> [f32; 4]> {
+pub fn dot4_fn_q8_0(kind: Kind) -> Option<Dot4Fn<BlockQ8_0>> {
     let k = active();
     match kind {
         Kind::Q4_0 => k.q4_0_q8_0_x4,
+        Kind::Q5_0 => k.q5_0_q8_0_x4,
         Kind::Q8_0 => k.q8_0_q8_0_x4,
         _ => None,
     }
@@ -580,19 +565,7 @@ pub fn dot4_fn_q8_0(kind: Kind) -> Option<fn(&[u8], [&[BlockQ8_0]; 4]) -> [f32; 
 
 /// Batched gate/up pair sharing one input (see [`matvec2_q8_k_input`]).
 #[allow(clippy::too_many_arguments)]
-pub fn matmul2_q8_k_input(
-    pool: &Pool,
-    out_a: &mut [f32],
-    out_b: &mut [f32],
-    w_a: &[u8],
-    w_b: &[u8],
-    xs: &[BlockQ8_K],
-    m: usize,
-    rows: usize,
-    row_bytes: usize,
-    dot: fn(&[u8], &[BlockQ8_K]) -> f32,
-    dot4: Option<fn(&[u8], [&[BlockQ8_K]; 4]) -> [f32; 4]>,
-) {
+pub fn matmul2_q8_k_input(pool: &Pool, out_a: &mut [f32], out_b: &mut [f32], w_a: &[u8], w_b: &[u8], xs: &[BlockQ8_K], m: usize, rows: usize, row_bytes: usize, dot: DotFn<BlockQ8_K>, dot4: Option<Dot4Fn<BlockQ8_K>>) {
     let nb = xs.len() / m.max(1);
     matmul_rows(pool, out_a, w_a, xs, m, nb, rows, row_bytes, dot, dot4);
     matmul_rows(pool, out_b, w_b, xs, m, nb, rows, row_bytes, dot, dot4);
@@ -600,19 +573,7 @@ pub fn matmul2_q8_k_input(
 
 /// Batched gate/up pair for Q8_0-quantized inputs.
 #[allow(clippy::too_many_arguments)]
-pub fn matmul2_q8_0_input(
-    pool: &Pool,
-    out_a: &mut [f32],
-    out_b: &mut [f32],
-    w_a: &[u8],
-    w_b: &[u8],
-    xs: &[BlockQ8_0],
-    m: usize,
-    rows: usize,
-    row_bytes: usize,
-    dot: fn(&[u8], &[BlockQ8_0]) -> f32,
-    dot4: Option<fn(&[u8], [&[BlockQ8_0]; 4]) -> [f32; 4]>,
-) {
+pub fn matmul2_q8_0_input(pool: &Pool, out_a: &mut [f32], out_b: &mut [f32], w_a: &[u8], w_b: &[u8], xs: &[BlockQ8_0], m: usize, rows: usize, row_bytes: usize, dot: DotFn<BlockQ8_0>, dot4: Option<Dot4Fn<BlockQ8_0>>) {
     let nb = xs.len() / m.max(1);
     matmul_rows(pool, out_a, w_a, xs, m, nb, rows, row_bytes, dot, dot4);
     matmul_rows(pool, out_b, w_b, xs, m, nb, rows, row_bytes, dot, dot4);

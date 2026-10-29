@@ -69,6 +69,7 @@ fn check_kind(kind: Kind, cols: usize, seed: u64) {
     for k in all_kernel_sets() {
         let v = match kind {
             Kind::Q4_0 => (k.q4_0_q8_0)(&wq, &q8_0),
+            Kind::Q5_0 => (k.q5_0_q8_0)(&wq, &q8_0),
             Kind::Q8_0 => (k.q8_0_q8_0)(&wq, &q8_0),
             Kind::Q4_K => (k.q4_k_q8_k)(&wq, &q8_k),
             Kind::Q5_K => (k.q5_k_q8_k)(&wq, &q8_k),
@@ -77,20 +78,13 @@ fn check_kind(kind: Kind, cols: usize, seed: u64) {
             Kind::BF16 => (k.bf16_f32)(&wq, &x),
             Kind::F32 => (k.f32_f32)(&wq, &x),
         };
-        assert!(
-            (v - fref).abs() < scale,
-            "{kind:?} cols={cols} kernels={}: {v} vs float ref {fref} (tol {scale})",
-            k.name
-        );
+        assert!((v - fref).abs() < scale, "{kind:?} cols={cols} kernels={}: {v} vs float ref {fref} (tol {scale})", k.name);
         results.push((k.name, v));
     }
     let base = results[0].1;
     for (name, v) in &results[1..] {
         // Integer accumulation order differs but results must agree to fp32 rounding.
-        assert!(
-            (v - base).abs() <= base.abs() * 1e-4 + 1e-3,
-            "{kind:?} cols={cols}: {name} = {v} differs from scalar = {base}"
-        );
+        assert!((v - base).abs() <= base.abs() * 1e-4 + 1e-3, "{kind:?} cols={cols}: {name} = {v} differs from scalar = {base}");
     }
 }
 
@@ -104,6 +98,7 @@ fn q4_0() {
 #[test]
 fn q8_0() {
     for (cols, seed) in [(32, 11), (64, 12), (96, 13), (2048, 14)] {
+        check_kind(Kind::Q5_0, cols, seed);
         check_kind(Kind::Q8_0, cols, seed);
     }
 }
@@ -167,7 +162,7 @@ fn x4_kernels_match_single() {
     let cols = 2048;
     let mut rng = Rng(777);
     for k in all_kernel_sets() {
-        for kind in [Kind::Q4_0, Kind::Q8_0, Kind::Q4_K, Kind::Q6_K] {
+        for kind in [Kind::Q4_0, Kind::Q5_0, Kind::Q8_0, Kind::Q4_K, Kind::Q6_K] {
             let w: Vec<f32> = (0..cols).map(|_| rng.f()).collect();
             let wq = quantize_row(kind, &w);
             let xs: Vec<Vec<f32>> = (0..4).map(|_| (0..cols).map(|_| rng.f() * 2.0).collect()).collect();
@@ -178,6 +173,7 @@ fn x4_kernels_match_single() {
                 }
                 let (dot, dot4) = match kind {
                     Kind::Q4_0 => (k.q4_0_q8_0, k.q4_0_q8_0_x4),
+                    Kind::Q5_0 => (k.q5_0_q8_0, k.q5_0_q8_0_x4),
                     _ => (k.q8_0_q8_0, k.q8_0_q8_0_x4),
                 };
                 if let Some(d4) = dot4 {
@@ -213,7 +209,7 @@ fn matmul_matches_matvec_bitwise() {
     let cols = 512;
     let mut rng = Rng(4242);
     let pool = Pool::new(3);
-    for kind in [Kind::Q4_0, Kind::Q8_0, Kind::Q4_K, Kind::Q5_K, Kind::Q6_K, Kind::F16] {
+    for kind in [Kind::Q4_0, Kind::Q5_0, Kind::Q8_0, Kind::Q4_K, Kind::Q5_K, Kind::Q6_K, Kind::F16] {
         let w: Vec<Vec<f32>> = (0..rows).map(|_| (0..cols).map(|_| rng.f()).collect()).collect();
         let wq: Vec<u8> = w.iter().flat_map(|r| quantize_row(kind, r)).collect();
         for m in [1usize, 3, 4, 7, 9] {
@@ -221,13 +217,21 @@ fn matmul_matches_matvec_bitwise() {
             let mut batched = vec![0f32; m * rows];
             let mut single = vec![0f32; rows];
             match kind {
-                Kind::Q4_0 | Kind::Q8_0 => {
+                Kind::Q4_0 | Kind::Q5_0 | Kind::Q8_0 => {
                     let mut q = Vec::new();
                     quantize_q8_0(&xs, &mut q);
-                    if kind == Kind::Q4_0 { matvec::matmul_q4_0(&pool, &mut batched, &wq, &q, m, rows, cols) } else { matvec::matmul_q8_0(&pool, &mut batched, &wq, &q, m, rows, cols) }
+                    match kind {
+                        Kind::Q4_0 => matvec::matmul_q4_0(&pool, &mut batched, &wq, &q, m, rows, cols),
+                        Kind::Q5_0 => matvec::matmul_q5_0(&pool, &mut batched, &wq, &q, m, rows, cols),
+                        _ => matvec::matmul_q8_0(&pool, &mut batched, &wq, &q, m, rows, cols),
+                    }
                     for i in 0..m {
                         let xi = &q[i * cols / 32..(i + 1) * cols / 32];
-                        if kind == Kind::Q4_0 { matvec::matvec_q4_0(&pool, &mut single, &wq, xi, rows, cols) } else { matvec::matvec_q8_0(&pool, &mut single, &wq, xi, rows, cols) }
+                        match kind {
+                            Kind::Q4_0 => matvec::matvec_q4_0(&pool, &mut single, &wq, xi, rows, cols),
+                            Kind::Q5_0 => matvec::matvec_q5_0(&pool, &mut single, &wq, xi, rows, cols),
+                            _ => matvec::matvec_q8_0(&pool, &mut single, &wq, xi, rows, cols),
+                        }
                         assert!(single.iter().zip(&batched[i * rows..(i + 1) * rows]).all(|(a, b)| a.to_bits() == b.to_bits()), "{kind:?} m={m} row set {i}");
                     }
                 }

@@ -245,7 +245,9 @@ pub struct State {
     pub ctx: usize,
     /// Residual stream.
     pub x: Buf<f32>,
-    /// Normalised input to attention / FFN.
+    /// Normalised input to attention / FFN, and the attention output
+    /// (`max(dim, q_dim)` elements: Qwen3 has more query dimensions than
+    /// model dimensions).
     pub xb: Buf<f32>,
     /// Output of attention / FFN before the residual add.
     pub xb2: Buf<f32>,
@@ -303,7 +305,7 @@ impl State {
         State {
             ctx,
             x: Buf::zeroed(d.dim),
-            xb: Buf::zeroed(d.dim),
+            xb: Buf::zeroed(d.dim.max(d.q_dim())),
             xb2: Buf::zeroed(d.dim),
             q: Buf::zeroed(d.q_dim()),
             k: Buf::zeroed(d.kv_dim()),
@@ -320,7 +322,7 @@ impl State {
             rope_cs: Buf::zeroed(d.rot_dim),
             max_batch,
             bx: Buf::zeroed(b * d.dim),
-            bxb: Buf::zeroed(b * d.dim),
+            bxb: Buf::zeroed(b * d.dim.max(d.q_dim())),
             bxb2: Buf::zeroed(b * d.dim),
             bq: Buf::zeroed(b * d.q_dim()),
             bk: Buf::zeroed(b * d.kv_dim()),

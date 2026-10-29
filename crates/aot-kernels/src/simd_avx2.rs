@@ -72,6 +72,45 @@ pub unsafe fn dot_q4_0_q8_0(w: &[u8], x: &[BlockQ8_0]) -> f32 {
     hsum_f32(acc)
 }
 
+/// Spread the 32 bits of `qh` over 32 bytes: byte `i` is 0xFF when bit `i`
+/// is set, else 0x00 (ggml's `bytes_from_bits_32`).
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn bytes_from_bits_32(p: *const u8) -> __m256i {
+    let qh = i32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
+    let shuf = _mm256_set_epi64x(0x0303030303030303, 0x0202020202020202, 0x0101010101010101, 0x0000000000000000);
+    let bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(qh), shuf);
+    let bit_mask = _mm256_set1_epi64x(0x7fbfdfeff7fbfdfe);
+    _mm256_cmpeq_epi8(_mm256_or_si256(bytes, bit_mask), _mm256_set1_epi64x(-1))
+}
+
+/// Q5_0 block elements as signed bytes in -16..15: the nibble, with 0xF0
+/// OR-ed in where the fifth bit is clear (sign extension of `q - 16`).
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn q5_0_elems(b: *const u8) -> __m256i {
+    let bx = nibbles_32(b.add(6));
+    let bxhi = _mm256_andnot_si256(bytes_from_bits_32(b.add(2)), _mm256_set1_epi8(0xF0u8 as i8));
+    _mm256_or_si256(bx, bxhi)
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_q5_0_q8_0(w: &[u8], x: &[BlockQ8_0]) -> f32 {
+    let nb = x.len();
+    debug_assert!(w.len() >= nb * Q5_0_SIZE);
+    let mut acc = _mm256_setzero_ps();
+    let wp = w.as_ptr();
+    for (i, y) in x.iter().enumerate() {
+        let b = wp.add(i * Q5_0_SIZE);
+        let d = _mm256_set1_ps(f16_at(b) * y.d);
+        let bx = q5_0_elems(b);
+        let by = _mm256_loadu_si256(y.qs.as_ptr() as *const __m256i);
+        let p = _mm256_cvtepi32_ps(mul_sum_i8_pairs(bx, by));
+        acc = _mm256_fmadd_ps(d, p, acc);
+    }
+    hsum_f32(acc)
+}
+
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn dot_q8_0_q8_0(w: &[u8], x: &[BlockQ8_0]) -> f32 {
     let nb = x.len();
@@ -241,6 +280,28 @@ pub unsafe fn dot_q4_0_q8_0_x4(w: &[u8], xs: [&[BlockQ8_0]; 4]) -> [f32; 4] {
         let b = wp.add(i * Q4_0_SIZE);
         let d = f16_at(b);
         let bx = _mm256_sub_epi8(nibbles_32(b.add(2)), off);
+        let ax = _mm256_sign_epi8(bx, bx);
+        for k in 0..4 {
+            let y = xs[k].get_unchecked(i);
+            let by = _mm256_loadu_si256(y.qs.as_ptr() as *const __m256i);
+            let sy = _mm256_sign_epi8(by, bx);
+            let p = _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), _mm256_set1_epi16(1)));
+            acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(d * y.d), p, acc[k]);
+        }
+    }
+    [hsum_f32(acc[0]), hsum_f32(acc[1]), hsum_f32(acc[2]), hsum_f32(acc[3])]
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_q5_0_q8_0_x4(w: &[u8], xs: [&[BlockQ8_0]; 4]) -> [f32; 4] {
+    let nb = xs[0].len();
+    debug_assert!(w.len() >= nb * Q5_0_SIZE);
+    let mut acc = [_mm256_setzero_ps(); 4];
+    let wp = w.as_ptr();
+    for i in 0..nb {
+        let b = wp.add(i * Q5_0_SIZE);
+        let d = f16_at(b);
+        let bx = q5_0_elems(b);
         let ax = _mm256_sign_epi8(bx, bx);
         for k in 0..4 {
             let y = xs[k].get_unchecked(i);
@@ -453,6 +514,7 @@ macro_rules! safe_wrappers_x4 {
 
 safe_wrappers_x4! {
     s_q4_0_x4 = dot_q4_0_q8_0_x4 : BlockQ8_0;
+    s_q5_0_x4 = dot_q5_0_q8_0_x4 : BlockQ8_0;
     s_q8_0_x4 = dot_q8_0_q8_0_x4 : BlockQ8_0;
     s_q4_k_x4 = dot_q4_k_q8_k_x4 : BlockQ8_K;
     s_q6_k_x4 = dot_q6_k_q8_k_x4 : BlockQ8_K;
@@ -460,6 +522,7 @@ safe_wrappers_x4! {
 
 safe_wrappers! {
     s_q4_0 = dot_q4_0_q8_0 : BlockQ8_0;
+    s_q5_0 = dot_q5_0_q8_0 : BlockQ8_0;
     s_q8_0 = dot_q8_0_q8_0 : BlockQ8_0;
     s_q4_k = dot_q4_k_q8_k : BlockQ8_K;
     s_q5_k = dot_q5_k_q8_k : BlockQ8_K;
@@ -473,6 +536,7 @@ safe_wrappers! {
 pub const KERNELS: super::Kernels = super::Kernels {
     name: "avx2",
     q4_0_q8_0: s_q4_0,
+    q5_0_q8_0: s_q5_0,
     q8_0_q8_0: s_q8_0,
     q4_k_q8_k: s_q4_k,
     q5_k_q8_k: s_q5_k,
@@ -481,6 +545,7 @@ pub const KERNELS: super::Kernels = super::Kernels {
     bf16_f32: s_bf16,
     f32_f32: s_f32,
     q4_0_q8_0_x4: Some(s_q4_0_x4),
+    q5_0_q8_0_x4: Some(s_q5_0_x4),
     q8_0_q8_0_x4: Some(s_q8_0_x4),
     q4_k_q8_k_x4: Some(s_q4_k_x4),
     q6_k_q8_k_x4: Some(s_q6_k_x4),
@@ -490,6 +555,7 @@ pub const KERNELS: super::Kernels = super::Kernels {
 pub const KERNELS_F16C: super::Kernels = super::Kernels {
     name: "avx2+f16c",
     q4_0_q8_0: s_q4_0,
+    q5_0_q8_0: s_q5_0,
     q8_0_q8_0: s_q8_0,
     q4_k_q8_k: s_q4_k,
     q5_k_q8_k: s_q5_k,
@@ -498,6 +564,7 @@ pub const KERNELS_F16C: super::Kernels = super::Kernels {
     bf16_f32: s_bf16,
     f32_f32: s_f32,
     q4_0_q8_0_x4: Some(s_q4_0_x4),
+    q5_0_q8_0_x4: Some(s_q5_0_x4),
     q8_0_q8_0_x4: Some(s_q8_0_x4),
     q4_k_q8_k_x4: Some(s_q4_k_x4),
     q6_k_q8_k_x4: Some(s_q6_k_x4),

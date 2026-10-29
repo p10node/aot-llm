@@ -212,16 +212,8 @@ fn print_info(rt: &Runtime) {
     let _ = writeln!(o, "dim={} hidden={} layers={} heads={} kv_heads={} head_dim={} vocab={} ctx_train={}", d.dim, d.hidden, d.n_layer, d.n_head, d.n_kv_head, d.head_dim, d.vocab, d.n_ctx_train);
     let _ = writeln!(o, "rope: base={} rot_dim={} scale={} freq_factors={}", d.rope_base, d.rot_dim, d.rope_scale, rt.rope_freqs.is_some());
     if let Some(t) = tok {
-        let _ = writeln!(o, 
-            "tokenizer:    {} ({} tokens, {} merges, bos={:?} eos={:?} eot={:?}, chat template: {})",
-            if t.is_spm() { "spm" } else { "bpe" },
-            t.n_tokens(),
-            t.n_merges(),
-            t.bos(),
-            t.eos(),
-            t.eot(),
-            chat::name(t.chat_format())
-        );
+        let _ =
+            writeln!(o, "tokenizer:    {} ({} tokens, {} merges, bos={:?} eos={:?} eot={:?}, chat template: {})", if t.is_spm() { "spm" } else { "bpe" }, t.n_tokens(), t.n_merges(), t.bos(), t.eos(), t.eot(), chat::name(t.chat_format()));
     }
     let _ = writeln!(o, "kernels:      {} ({} cores)", matvec::detect_kernels().name, default_threads());
     let _ = writeln!(o, "gpu:          {}", if rt.forward_gpu.is_some() { "metal (--device auto|cpu|gpu)" } else { "none (compile with --gpu metal)" });

@@ -29,7 +29,7 @@ pub fn system_prefix(fmt: u32, system: Option<&str>) -> Option<String> {
                 s.push_str("</s>\n");
             }
         }
-        CHATML => {
+        CHATML | QWEN3 => {
             if let Some(sys) = system {
                 s.push_str("<|im_start|>system\n");
                 s.push_str(sys);
@@ -58,6 +58,13 @@ pub fn system_prefix(fmt: u32, system: Option<&str>) -> Option<String> {
                 s.push_str("\n\n");
             }
         }
+        PHI3 => {
+            if let Some(sys) = system {
+                s.push_str("<|system|>\n");
+                s.push_str(sys);
+                s.push_str("<|end|>\n");
+            }
+        }
         _ => return None,
     }
     Some(s)
@@ -82,6 +89,14 @@ pub fn user_turn(fmt: u32, user: &str) -> Option<String> {
             s.push_str(user);
             s.push_str("<|im_end|>\n<|im_start|>assistant\n");
         }
+        QWEN3 => {
+            // Qwen3 with `enable_thinking=false`: the template closes an
+            // empty think block before the answer. `--think` selects CHATML
+            // instead and lets the model reason first.
+            s.push_str("<|im_start|>user\n");
+            s.push_str(user);
+            s.push_str("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        }
         LLAMA2 | MISTRAL => {
             s.push_str(user);
             s.push_str(" [/INST]");
@@ -89,6 +104,11 @@ pub fn user_turn(fmt: u32, user: &str) -> Option<String> {
         GEMMA => {
             s.push_str(user);
             s.push_str("<end_of_turn>\n<start_of_turn>model\n");
+        }
+        PHI3 => {
+            s.push_str("<|user|>\n");
+            s.push_str(user);
+            s.push_str("<|end|>\n<|assistant|>\n");
         }
         _ => return None,
     }
@@ -108,6 +128,8 @@ pub fn name(fmt: u32) -> &'static str {
         LLAMA2 => "llama2",
         MISTRAL => "mistral",
         GEMMA => "gemma",
+        QWEN3 => "qwen3",
+        PHI3 => "phi3",
         _ => "none",
     }
 }

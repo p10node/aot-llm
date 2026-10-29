@@ -46,20 +46,11 @@ impl Pool {
     /// (the calling thread participates as thread 0).
     pub fn new(n_threads: usize) -> Self {
         let n_threads = n_threads.max(1);
-        let shared = Arc::new(Shared {
-            n_threads,
-            epoch: AtomicUsize::new(0),
-            pending: AtomicUsize::new(0),
-            stop: AtomicBool::new(false),
-            job: std::cell::UnsafeCell::new(std::ptr::null::<fn(usize, usize)>() as *const Job<'static>),
-        });
+        let shared = Arc::new(Shared { n_threads, epoch: AtomicUsize::new(0), pending: AtomicUsize::new(0), stop: AtomicBool::new(false), job: std::cell::UnsafeCell::new(std::ptr::null::<fn(usize, usize)>() as *const Job<'static>) });
         let workers = (1..n_threads)
             .map(|tid| {
                 let s = Arc::clone(&shared);
-                thread::Builder::new()
-                    .name(format!("aot-worker-{tid}"))
-                    .spawn(move || worker(s, tid))
-                    .expect("failed to spawn worker thread")
+                thread::Builder::new().name(format!("aot-worker-{tid}")).spawn(move || worker(s, tid)).expect("failed to spawn worker thread")
             })
             .collect();
         Pool { shared, workers }

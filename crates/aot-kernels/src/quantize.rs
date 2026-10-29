@@ -39,6 +39,37 @@ pub fn quantize_row_q4_0(x: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Encode a row (multiple of 32 values) as Q5_0.
+pub fn quantize_row_q5_0(x: &[f32]) -> Vec<u8> {
+    assert_eq!(x.len() % QK8_0, 0);
+    let mut out = Vec::with_capacity(x.len() / QK8_0 * Q5_0_SIZE);
+    for blk in x.as_chunks::<QK8_0>().0 {
+        let mut amax = 0f32;
+        let mut max = 0f32;
+        for &v in blk {
+            if v.abs() > amax {
+                amax = v.abs();
+                max = v;
+            }
+        }
+        let d = max / -16.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let mut qh = 0u32;
+        let mut qs = [0u8; 16];
+        for j in 0..16 {
+            let lo = (nearest(blk[j] * id) + 16).clamp(0, 31) as u32;
+            let hi = (nearest(blk[j + 16] * id) + 16).clamp(0, 31) as u32;
+            qs[j] = ((lo & 0xF) | ((hi & 0xF) << 4)) as u8;
+            qh |= (lo >> 4) << j;
+            qh |= (hi >> 4) << (j + 16);
+        }
+        out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        out.extend_from_slice(&qh.to_le_bytes());
+        out.extend_from_slice(&qs);
+    }
+    out
+}
+
 /// Encode a row (multiple of 32 values) as Q8_0.
 pub fn quantize_row_q8_0(x: &[f32]) -> Vec<u8> {
     assert_eq!(x.len() % QK8_0, 0);
@@ -254,6 +285,7 @@ pub fn quantize_row(kind: Kind, x: &[f32]) -> Vec<u8> {
         Kind::F16 => quantize_row_f16(x),
         Kind::BF16 => quantize_row_bf16(x),
         Kind::Q4_0 => quantize_row_q4_0(x),
+        Kind::Q5_0 => quantize_row_q5_0(x),
         Kind::Q8_0 => quantize_row_q8_0(x),
         Kind::Q4_K => quantize_row_q4_k(x),
         Kind::Q5_K => quantize_row_q5_k(x),
@@ -294,6 +326,7 @@ mod tests {
         check(Kind::BF16, 1e-2);
         check(Kind::Q8_0, 1e-2);
         check(Kind::Q4_0, 0.1);
+        check(Kind::Q5_0, 0.05);
         check(Kind::Q4_K, 0.08);
         check(Kind::Q5_K, 0.04);
         check(Kind::Q6_K, 0.02);

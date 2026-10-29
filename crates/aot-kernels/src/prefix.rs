@@ -55,6 +55,7 @@ impl<'a> Prefix<'a> {
         Some(Prefix { tokens, n_layer, kv_dim, data: &blob[data_off..need] })
     }
 
+    /// Number of tokens in the blob (cached ones first).
     pub fn len(&self) -> usize {
         self.tokens.len()
     }

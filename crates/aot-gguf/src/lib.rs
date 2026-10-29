@@ -202,8 +202,7 @@ impl GgufFile {
                 dims.push(r.u64("tensor dim")?);
             }
             let ty_raw = r.u32("tensor type")?;
-            let ty = GgmlType::from_u32(ty_raw)
-                .ok_or_else(|| GgufError::BadTensorType(ty_raw, name.clone()))?;
+            let ty = GgmlType::from_u32(ty_raw).ok_or_else(|| GgufError::BadTensorType(ty_raw, name.clone()))?;
             let offset = r.u64("tensor offset")?;
             tensor_index.insert(name.clone(), tensors.len());
             tensors.push(TensorInfo { name, dims, ty, offset });
@@ -215,12 +214,7 @@ impl GgufFile {
             let start = data_offset + t.offset;
             let end = start + t.n_bytes();
             if end > file_len {
-                return Err(GgufError::TensorOutOfBounds {
-                    name: t.name.clone(),
-                    start,
-                    end,
-                    size: file_len,
-                });
+                return Err(GgufError::TensorOutOfBounds { name: t.name.clone(), start, end, size: file_len });
             }
         }
 
@@ -522,10 +516,7 @@ mod tests {
         let mut w = GgufWriter::new();
         w.kv("general.architecture", MetaValue::String("llama".into()))
             .kv("llama.block_count", MetaValue::U32(2))
-            .kv("tokenizer.ggml.tokens", MetaValue::Array(vec![
-                MetaValue::String("a".into()),
-                MetaValue::String("b".into()),
-            ]))
+            .kv("tokenizer.ggml.tokens", MetaValue::Array(vec![MetaValue::String("a".into()), MetaValue::String("b".into())]))
             .tensor("x", &[4, 2], GgmlType::F32, vec![0u8; 32])
             .tensor("y", &[32], GgmlType::Q4_0, vec![1u8; 18]);
         let bytes = w.finish();

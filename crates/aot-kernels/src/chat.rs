@@ -120,6 +120,28 @@ pub fn format(fmt: u32, system: Option<&str>, user: &str) -> Option<String> {
     Some(system_prefix(fmt, system)? + &user_turn(fmt, user)?)
 }
 
+/// What closes the assistant's reply in the template (the text of the stop
+/// token plus any separator), for continuing a conversation whose last
+/// reply was generated without its stop token.
+pub fn assistant_end(fmt: u32) -> Option<&'static str> {
+    Some(match fmt {
+        LLAMA3 => "<|eot_id|>",
+        ZEPHYR => "</s>\n",
+        CHATML | QWEN3 => "<|im_end|>\n",
+        LLAMA2 | MISTRAL => " </s><s>",
+        GEMMA => "<end_of_turn>\n",
+        PHI3 => "<|end|>\n",
+        _ => return None,
+    })
+}
+
+/// The text that follows a finished reply when the user speaks again:
+/// closes the reply, opens the next user turn and the assistant header.
+/// Appended to a saved conversation by `--load-kv --chat`.
+pub fn continuation(fmt: u32, user: &str) -> Option<String> {
+    Some(assistant_end(fmt)?.to_string() + &system_prefix(fmt, None)? + &user_turn(fmt, user)?)
+}
+
 pub fn name(fmt: u32) -> &'static str {
     match fmt {
         LLAMA3 => "llama3",

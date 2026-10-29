@@ -476,6 +476,50 @@ fn llama_compile_run_and_match_reference() {
     compile_run_and_match_reference(LLAMA);
 }
 
+/// The CLI's output constraints and the saved-run continuation.
+#[test]
+fn cli_stop_choices_and_kv_continuation() {
+    let cfg = LLAMA;
+    let mut rng = Rng(0x5EED);
+    let (vocab, scores, types) = vocab();
+    let model = build_model(cfg, &mut rng, vocab.len());
+    let gguf = build_gguf(&model, &vocab, &scores, &types);
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-cli");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let gguf_path = tmp.join("tiny.gguf");
+    std::fs::write(&gguf_path, &gguf).unwrap();
+    let out = tmp.join("tiny_bin");
+    let status = Command::new(env!("CARGO_BIN_EXE_aot-llm")).args(["compile", "--model"]).arg(&gguf_path).arg("--output").arg(&out).arg("--quiet").status().unwrap();
+    assert!(status.success());
+    let run = |args: &[&str]| -> String {
+        let o = Command::new(&out).args(args).output().unwrap();
+        assert!(o.status.success(), "{:?}: {}", args, String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').to_string()
+    };
+
+    // --choices: the answer is one of the given strings, nothing else.
+    for _ in 0..3 {
+        let a = run(&["--prompt", "the capital of", "--choices", "hello,world", "-n", "8", "-q"]);
+        assert!(a == "hello" || a == "world", "{a:?}");
+    }
+    let a = run(&["--prompt", "the capital of", "--choice", "hello world", "--choice", "is", "-n", "8", "-q", "--temp", "0.9"]);
+    assert!(a == "hello world" || a == "is", "{a:?}");
+
+    // --stop: the stop string never appears in the output.
+    let a = run(&["--prompt", "the capital of", "--stop", "l", "-n", "24", "-q", "--temp", "1.0", "--top-k", "0", "--seed", "3"]);
+    assert!(!a.contains('l'), "{a:?}");
+
+    // --save-kv / --load-kv: continuing a saved prompt gives the logits of
+    // the whole prompt evaluated at once.
+    let kv = tmp.join("run.kv");
+    let kv_s = kv.to_str().unwrap();
+    run(&["--prompt", "the capital", "-n", "0", "-q", "--save-kv", kv_s]);
+    assert!(kv.exists());
+    let continued = run(&["--load-kv", kv_s, "--prompt", "of hello world is", "--dump-logits", "-q"]);
+    let whole = run(&["--prompt", "the capital of hello world is", "--dump-logits", "-q"]);
+    assert_eq!(continued, whole, "--load-kv continuation differs from the whole prompt");
+}
+
 #[test]
 fn qwen2_compile_run_and_match_reference() {
     compile_run_and_match_reference(QWEN2);

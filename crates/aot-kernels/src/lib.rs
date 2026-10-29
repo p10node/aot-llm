@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod chat;
+pub mod constrain;
 pub mod matvec;
 #[cfg(target_os = "macos")]
 pub mod metal;

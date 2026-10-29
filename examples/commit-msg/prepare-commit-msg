@@ -1,0 +1,15 @@
+#!/usr/bin/env sh
+# Git hook: fill in the commit message from the staged diff when none is given.
+# Install: cp examples/commit-msg/prepare-commit-msg .git/hooks/ && chmod +x .git/hooks/prepare-commit-msg
+# Point COMMIT_MSG_BIN at the binary produced by build.sh.
+MSG_FILE=$1
+SOURCE=${2:-}
+BIN=${COMMIT_MSG_BIN:-"$(git rev-parse --show-toplevel)/commit-msg"}
+[ -z "$SOURCE" ] || exit 0           # -m, -F, merge, squash, amend: leave it alone
+[ -x "$BIN" ] || exit 0
+DIFF=$(git diff --cached --no-color --stat -p -U2 | head -c 4000)
+[ -n "$DIFF" ] || exit 0
+SYSTEM=$(cat "$(dirname "$0")/../../examples/commit-msg/system-prompt.txt" 2>/dev/null || true)
+LINE=$(printf '%s\n' "$DIFF" | "$BIN" --chat --system "$SYSTEM" --stop '\n' -n 40 -q | head -n 1)
+[ -n "$LINE" ] || exit 0
+{ printf '%s\n' "$LINE"; cat "$MSG_FILE"; } > "$MSG_FILE.tmp" && mv "$MSG_FILE.tmp" "$MSG_FILE"

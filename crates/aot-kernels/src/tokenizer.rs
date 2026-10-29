@@ -269,6 +269,14 @@ impl Tokenizer {
     /// Tokenize `text`. With `parse_special`, occurrences of special token
     /// strings (e.g. `<|eot_id|>`) in the text are mapped to their ids.
     pub fn encode(&self, text: &str, add_bos: bool, parse_special: bool) -> Vec<u32> {
+        self.encode_ext(text, add_bos, parse_special, true)
+    }
+
+    /// [`Tokenizer::encode`] with control over the SentencePiece dummy
+    /// space: with `space_prefix == false` the text is tokenized as a
+    /// continuation of preceding text (no `▁` inserted at the start). No
+    /// effect on BPE vocabularies.
+    pub fn encode_ext(&self, text: &str, add_bos: bool, parse_special: bool, space_prefix: bool) -> Vec<u32> {
         let mut out = Vec::with_capacity(text.len() / 3 + 2);
         if add_bos {
             if let Some(b) = self.bos() {
@@ -276,7 +284,7 @@ impl Tokenizer {
             }
         }
         let bytes = text.as_bytes();
-        let mut prev_special = true;
+        let mut prev_special = space_prefix;
         let mut i = 0usize;
         let mut seg_start = 0usize;
         while i < bytes.len() {

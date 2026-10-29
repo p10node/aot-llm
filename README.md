@@ -86,6 +86,12 @@ cargo build --release
 ./qwen3 --chat --prompt "Write one sentence about the moon."
 ./target/release/aot-llm compile --model ./qwen2.5-0.5b-instruct-q4_k_m.gguf --output ./qwen25
 
+
+# Tools: constrained answers, stop strings, conversations across processes
+./qwen3 --chat --prompt "Is this review positive? 'Broke after two days.'" --choices positive,negative,neutral
+git diff | ./qwen3 --chat --system "One-line commit subject." --stop '\n'
+./qwen3 --chat --prompt "My name is Pierre." --save-kv talk.kv
+./qwen3 --chat --prompt "What is my name?" --load-kv talk.kv --save-kv talk.kv   # evaluates only the new turn
 ```
 
 Generated binary options:
@@ -104,6 +110,10 @@ Generated binary options:
     --chat               Wrap the prompt in the model's chat template (llama3 / zephyr / chatml / qwen3 / llama2 / mistral / gemma)
     --system TEXT        System prompt for --chat
     --think              Let a Qwen3 model think before answering (--chat)
+    --stop TEXT          Stop when the output contains TEXT (repeatable; \n escapes allowed)
+    --choices A,B,C      Answer with exactly one of the given strings (also --choice TEXT, repeatable)
+    --save-kv FILE       After generating, write the tokens and KV cache of the whole run to FILE
+    --load-kv FILE       Continue a saved run: the prompt is appended (--chat: as the next user turn)
     --no-bos             Do not prepend the BOS token
     --no-prefetch        Do not page in the weights from background threads at startup
     --no-prefix-cache    Ignore the compile-time KV prefix cache
@@ -161,6 +171,7 @@ tokens -> embedding -> [RMSNorm -> Attention(GQA, RoPE, KV cache) -> + -> RMSNor
 ```
 
 Qwen2 adds bias vectors to the q / k / v projections and Qwen3 a per-head RMSNorm of q and k before RoPE; both rotate `(i, i + rot_dim / 2)` pairs (the GPT-NeoX layout) instead of adjacent elements. Phi-3 stores q / k / v as one `attn_qkv` tensor and gate / up as one `ffn_up` tensor; the compiler addresses the parts as row ranges of the same bytes, so the generated code is the plain block. The code generator emits exactly the operators the architecture has, on the CPU and on the GPU (where the NEOX models rotate in a separate dispatch because the pairs are half a head apart, and the biases are added in the epilogue of the matrix kernels).
+
 
 Per matmul, the f32 activation vector is quantized once to Q8_0 (for Q4_0/Q8_0 weights) or Q8_K (for K-quants) and every output row is an integer dot product scaled back to f32, the same scheme ggml uses, so results match llama.cpp. During decoding the q/k/v projections form one parallel region and gate/up another; rows are handed out in dynamic chunks; attention is parallel over heads. The thread pool keeps workers hot between the few hundred small parallel regions of a decode step.
 

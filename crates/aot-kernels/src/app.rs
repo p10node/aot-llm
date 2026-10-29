@@ -7,6 +7,7 @@
 //! model independent.
 
 use super::chat;
+use super::constrain::{unescape, Choices, StopMatcher};
 use super::matvec;
 use super::pool::Pool;
 use super::prefix::Prefix;
@@ -69,6 +70,7 @@ struct Args {
     threads: Option<usize>,
     batch: usize,
     chat: bool,
+    think: bool,
     system: Option<String>,
     no_bos: bool,
     no_prefetch: bool,
@@ -82,6 +84,10 @@ struct Args {
     dump_logits: bool,
     no_prefix_cache: bool,
     bake_prefix_kv: Option<PathBuf>,
+    stop: Vec<String>,
+    choices: Vec<String>,
+    save_kv: Option<PathBuf>,
+    load_kv: Option<PathBuf>,
 }
 
 const USAGE: &str = "\
@@ -100,6 +106,11 @@ Options:
   -b, --batch N            Prompt tokens per batched step, 1 = token by token [default: 64]
       --chat               Wrap the prompt in the model's chat template
       --system TEXT        System prompt for --chat
+      --think              Let a Qwen3 model think before answering (--chat)
+      --stop TEXT          Stop when the output contains TEXT (repeatable; \n escapes allowed)
+      --choices A,B,C      Answer with exactly one of the given strings (also --choice TEXT, repeatable)
+      --save-kv FILE       After generating, write the tokens and KV cache of the whole run to FILE
+      --load-kv FILE       Continue a saved run: the prompt is appended (--chat: as the next user turn)
       --no-bos             Do not prepend the BOS token
       --no-prefetch        Do not page in the weights from background threads at startup
       --kernels NAME       auto|scalar|neon|neon-dotprod|avx2
@@ -124,6 +135,7 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
         threads: None,
         batch: DEFAULT_BATCH,
         chat: false,
+        think: false,
         system: None,
         no_bos: false,
         no_prefetch: false,
@@ -137,6 +149,10 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
         dump_logits: false,
         no_prefix_cache: false,
         bake_prefix_kv: None,
+        stop: Vec::new(),
+        choices: Vec::new(),
+        save_kv: None,
+        load_kv: None,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -158,6 +174,7 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
             "-t" | "--threads" => a.threads = Some(next(&mut i, f)?.parse().map_err(|_| "bad --threads")?),
             "-b" | "--batch" => a.batch = next(&mut i, f)?.parse::<usize>().map_err(|_| "bad --batch")?.max(1),
             "--chat" => a.chat = true,
+            "--think" => a.think = true,
             "--system" => a.system = Some(next(&mut i, f)?),
             "--no-bos" => a.no_bos = true,
             "--no-prefetch" => a.no_prefetch = true,
@@ -170,6 +187,11 @@ fn parse_args(rt: &Runtime) -> Result<Args, String> {
             "--dump-logits" => a.dump_logits = true,
             "--no-prefix-cache" => a.no_prefix_cache = true,
             "--bake-prefix-kv" => a.bake_prefix_kv = Some(PathBuf::from(next(&mut i, f)?)),
+            "--stop" => a.stop.push(unescape(&next(&mut i, f)?)),
+            "--choice" => a.choices.push(next(&mut i, f)?),
+            "--choices" => a.choices.extend(next(&mut i, f)?.split(',').filter(|c| !c.is_empty()).map(str::to_string)),
+            "--save-kv" => a.save_kv = Some(PathBuf::from(next(&mut i, f)?)),
+            "--load-kv" => a.load_kv = Some(PathBuf::from(next(&mut i, f)?)),
             "-q" | "--quiet" => a.quiet = true,
             "--info" => a.info = true,
             "-h" | "--help" => {
@@ -350,11 +372,15 @@ pub fn main(rt: Runtime) -> i32 {
         }
     };
     let text = if args.chat {
+        let fmt = if args.think && tok.chat_format() == super::tokenizer::chat_format::QWEN3 { super::tokenizer::chat_format::CHATML } else { tok.chat_format() };
         let built = if args.bake_prefix_kv.is_some() {
             // Baking: only the part of the template that precedes the user turn.
-            chat::system_prefix(tok.chat_format(), args.system.as_deref()).filter(|s| !s.is_empty())
+            chat::system_prefix(fmt, args.system.as_deref()).filter(|s| !s.is_empty())
+        } else if args.load_kv.is_some() {
+            // Continuing a saved conversation: close the last reply, open the next turn.
+            chat::continuation(fmt, &raw)
         } else {
-            chat::format(tok.chat_format(), args.system.as_deref(), &raw)
+            chat::format(fmt, args.system.as_deref(), &raw)
         };
         match built {
             Some(t) => t,
@@ -366,20 +392,42 @@ pub fn main(rt: Runtime) -> i32 {
     } else {
         raw
     };
-    let add_bos = !args.no_bos && tok.add_bos();
+    let d = rt.dims;
+    // A saved run (--load-kv): its tokens come first, the prompt continues them.
+    let saved: Option<Prefix> = match &args.load_kv {
+        None => None,
+        Some(path) => match weights::mmap_file(path) {
+            Ok(blob) => match Prefix::parse(blob, d) {
+                Some(p) => Some(p),
+                None => {
+                    eprintln!("error: {} is not a KV cache of this model", path.display());
+                    return 2;
+                }
+            },
+            Err(e) => {
+                eprintln!("error: cannot open {}: {e}", path.display());
+                return 2;
+            }
+        },
+    };
+    let add_bos = !args.no_bos && tok.add_bos() && saved.is_none();
     let t_enc0 = Instant::now();
-    let prompt = tok.encode(&text, add_bos, true);
+    let mut prompt = tok.encode(&text, add_bos, true);
+    if let Some(pre) = &saved {
+        let mut all = pre.tokens.clone();
+        all.append(&mut prompt);
+        prompt = all;
+    }
     let t_encode = t_enc0.elapsed();
     if prompt.is_empty() {
         eprintln!("error: empty prompt");
         return 2;
     }
-    let d = rt.dims;
     let ctx = args.ctx.unwrap_or_else(|| (prompt.len() + args.max_tokens).min(d.n_ctx_train.max(prompt.len() + 1)));
     if ctx > d.n_ctx_train && !args.quiet {
         eprintln!("warning: context {ctx} exceeds the training context {}", d.n_ctx_train);
     }
-    if prompt.len() >= ctx {
+    if prompt.len() > ctx {
         eprintln!("error: prompt has {} tokens but the context is {ctx}; raise --ctx", prompt.len());
         return 2;
     }
@@ -407,13 +455,17 @@ pub fn main(rt: Runtime) -> i32 {
     let t_gpu = t_gpu0.elapsed();
     let t_ready = t0.elapsed();
 
-    // Compile-time KV prefix: skip the tokens whose cache is embedded.
+    // KV rows that need no evaluation: a saved run (--load-kv) or the
+    // compile-time prefix embedded in the binary.
     let mut cached = 0usize;
-    if !args.no_prefix_cache && args.bake_prefix_kv.is_none() {
+    if let Some(pre) = &saved {
+        pre.load_into(&mut state);
+        cached = pre.cached();
+    } else if !args.no_prefix_cache && args.bake_prefix_kv.is_none() {
         if let Some(pre) = Prefix::parse(rt.prefix_kv, d) {
             if prompt.len() > pre.len() && prompt.starts_with(&pre.tokens) {
                 pre.load_into(&mut state);
-                cached = pre.len();
+                cached = pre.cached();
             }
         }
     }
@@ -434,7 +486,7 @@ pub fn main(rt: Runtime) -> i32 {
     let t_prompt = t1.elapsed();
 
     if let Some(path) = &args.bake_prefix_kv {
-        let blob = super::prefix::serialize(&state, d, &prompt);
+        let blob = super::prefix::serialize(&state, d, &prompt, prompt.len());
         if let Err(e) = std::fs::write(path, &blob) {
             eprintln!("error: cannot write {}: {e}", path.display());
             return 1;
@@ -482,6 +534,9 @@ pub fn main(rt: Runtime) -> i32 {
 
     // Generation.
     let mut sampler = Sampler::new(args.sampler.clone());
+    let mut stopper = StopMatcher::new(&args.stop);
+    let mut choices = if args.choices.is_empty() { None } else { Some(Choices::new(&tok, &args.choices)) };
+    let stop_ids: Vec<u32> = (0..d.vocab as u32).filter(|&t| tok.is_stop(t)).collect();
     let mut all = prompt.clone();
     let mut generated = 0usize;
     let mut out_buf = Vec::new();
@@ -490,36 +545,99 @@ pub fn main(rt: Runtime) -> i32 {
     let mut pos = prompt.len();
     let t2 = Instant::now();
     let mut t_first = None;
+    let mut why = "max tokens";
+    // With --choices the pieces are collected and the chosen string is
+    // printed verbatim at the end (the tokenizer's spelling of a choice can
+    // carry a leading space).
+    let mut choice_buf: Vec<u8> = Vec::new();
     while generated < args.max_tokens && pos < ctx {
+        if let Some(ch) = &mut choices {
+            ch.mask(&mut state.logits, &stop_ids);
+        }
         let next = sampler.sample(&mut state.logits, &all);
         if t_first.is_none() {
             t_first = Some(t2.elapsed());
         }
         let stop = tok.is_stop(next);
         if stop && !args.show_special {
+            why = "stop token";
             break;
         }
+        // Constrained answers: follow the trie; a stop token at a terminal
+        // node (allowed by the mask) ends the shorter choice.
+        let choice_done = match &mut choices {
+            Some(ch) => {
+                if !ch.advance(next) {
+                    why = "choice";
+                    break;
+                }
+                ch.done()
+            }
+            None => false,
+        };
         all.push(next);
         generated += 1;
         if args.tokens_only {
             let _ = write!(out, "{next} ");
             let _ = out.flush();
+        } else if choices.is_some() {
+            tok.decode_piece(next, &mut choice_buf, args.show_special);
         } else {
-            tok.decode_piece(next, &mut out_buf, args.show_special);
+            let mut piece = Vec::new();
+            tok.decode_piece(next, &mut piece, args.show_special);
+            let emit = stopper.feed(&piece);
+            out_buf.extend_from_slice(&emit);
             flush_utf8(&mut out_buf, &mut out);
         }
+        if stopper.matched.is_some() {
+            why = "stop string";
+            break;
+        }
+        if choice_done {
+            why = "choice";
+            break;
+        }
         if stop || generated >= args.max_tokens || pos >= ctx {
+            if stop {
+                why = "stop token";
+            } else if pos >= ctx {
+                why = "context full";
+            }
             break;
         }
         step(&rt, &mut state, &weights, &pool, &mut gpu, next, pos, true);
         pos += 1;
     }
     let t_gen = t2.elapsed();
+    if stopper.matched.is_none() {
+        out_buf.extend(stopper.finish());
+    }
+    if let Some(ch) = &choices {
+        if !args.tokens_only {
+            match ch.selected() {
+                Some(t) => out_buf.extend_from_slice(t.as_bytes()),
+                None => out_buf.extend_from_slice(&choice_buf),
+            }
+        }
+    }
     if !out_buf.is_empty() {
         let _ = out.write_all(String::from_utf8_lossy(&out_buf).as_bytes());
     }
     let _ = out.write_all(b"\n");
     let _ = out.flush();
+
+    // --save-kv: every token of the run, with cache rows for the evaluated
+    // ones (the last generated token was never fed back).
+    if let Some(path) = &args.save_kv {
+        let blob = super::prefix::serialize(&state, d, &all, pos);
+        if let Err(e) = std::fs::write(path, &blob) {
+            eprintln!("error: cannot write {}: {e}", path.display());
+            return 1;
+        }
+        if !args.quiet {
+            eprintln!("[aot-llm] saved {} tokens ({} with KV rows, {:.1} MB) to {}", all.len(), pos, mb(blob.len() as u64), path.display());
+        }
+    }
 
     if !args.quiet {
         let ps = t_prompt.as_secs_f64();
@@ -550,7 +668,7 @@ pub fn main(rt: Runtime) -> i32 {
             Some(g) => format!("metal ({})", g.name),
             None => matvec::active_kernels().name.to_string(),
         };
-        line.push_str(&format!(" | {} threads | {} | ctx {}", threads, backend, ctx));
+        line.push_str(&format!(" | {} threads | {} | ctx {} | end: {why}", threads, backend, ctx));
         eprintln!("{line}");
     }
     0

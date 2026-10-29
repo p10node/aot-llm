@@ -7,6 +7,7 @@ pub const RT_SOURCES: &[(&str, &str)] = &[
     ("mod.rs", include_str!("../../aot-kernels/src/lib.rs")),
     ("app.rs", include_str!("../../aot-kernels/src/app.rs")),
     ("chat.rs", include_str!("../../aot-kernels/src/chat.rs")),
+    ("constrain.rs", include_str!("../../aot-kernels/src/constrain.rs")),
     ("matvec.rs", include_str!("../../aot-kernels/src/matvec.rs")),
     ("metal.rs", include_str!("../../aot-kernels/src/metal.rs")),
     ("shaders.metal", include_str!("../../aot-kernels/src/shaders.metal")),

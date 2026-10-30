@@ -567,20 +567,16 @@ fn emit_gpu_forwards(o: &mut String, spec: &ModelSpec) {
         g.act_mul(BufId::Hb, BufId::Hb2, {hidden}, {gelu});\n"
             )
         };
+        // The three projections share the input: one dispatch when they share
+        // a format (`Gpu::mv3` falls back to three otherwise).
         let qkv = if f.rope_neox {
             format!(
-                "        g.mv(BufId::Q, 0, &l.wq, BufId::Xb, 0, None, MvOpts {{ bias: {bq}, ..MvOpts::default() }});
-        g.mv(BufId::KCache, kv_at, &l.wk, BufId::Xb, 0, None, MvOpts {{ bias: {bk}, ..MvOpts::default() }});
-        g.mv(BufId::VCache, kv_at, &l.wv, BufId::Xb, 0, None, MvOpts {{ bias: {bv}, ..MvOpts::default() }});
+                "        g.mv3([(BufId::Q, 0), (BufId::KCache, kv_at), (BufId::VCache, kv_at)], [&l.wq, &l.wk, &l.wv], BufId::Xb, None, None, [{bq}, {bk}, {bv}]);
 {norm}        g.rope_ex(BufId::Q, BufId::KCache, kv_at, 1, BufId::{cs}, &DIMS, true);\n",
                 norm = qk_norm("1")
             )
         } else {
-            format!(
-                "        g.mv(BufId::Q, 0, &l.wq, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::{cs}), bias: {bq}, ..MvOpts::default() }});
-        g.mv(BufId::KCache, kv_at, &l.wk, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::{cs}), bias: {bk}, ..MvOpts::default() }});
-        g.mv(BufId::VCache, kv_at, &l.wv, BufId::Xb, 0, None, MvOpts {{ bias: {bv}, ..MvOpts::default() }});\n"
-            )
+            format!("        g.mv3([(BufId::Q, 0), (BufId::KCache, kv_at), (BufId::VCache, kv_at)], [&l.wq, &l.wk, &l.wv], BufId::Xb, Some(&DIMS), Some(BufId::{cs}), [{bq}, {bk}, {bv}]);\n")
         };
         // Residual joins: fused into the products, or normalised first (Gemma).
         let (wo, down) = if f.post_norms {

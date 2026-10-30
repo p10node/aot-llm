@@ -279,6 +279,17 @@ pub struct MvOpts<'a> {
     pub bias: Option<&'a Tensor>,
 }
 #[repr(C)]
+struct Mv3Args {
+    cols: u32,
+    rows0: u32,
+    rows1: u32,
+    rows2: u32,
+    rope: u32,
+    head_dim: u32,
+    rot_dim: u32,
+    bias: u32,
+}
+#[repr(C)]
 struct NormArgs {
     n: u32,
     m: u32,
@@ -324,6 +335,8 @@ pub struct Gpu {
     queue: Id,
     /// Matrix-vector kernels per format, for 1, 2, 4 and 8 rows per simdgroup.
     pso_mv: [[Id; 4]; N_KINDS],
+    /// Fused three-matrix products (q / k / v), for 1, 2 and 4 rows per simdgroup.
+    pso_mv3: [[Id; 3]; N_KINDS],
     pso_mm: [Id; N_KINDS],
     pso_gate: [Id; N_KINDS],
     pso_rmsnorm: Id,
@@ -383,6 +396,7 @@ impl Gpu {
                 pso_rope: psos.4,
                 pso_attention: psos.5,
                 pso_silu: psos.6,
+                pso_mv3: psos.7,
                 wbuf,
                 bufs,
                 cb: null_mut(),
@@ -397,7 +411,12 @@ impl Gpu {
     }
 
     #[allow(clippy::type_complexity)]
-    unsafe fn init(o: &Objc, copy_all_devices: unsafe extern "C" fn() -> Id, weights: &'static [u8], state: &State) -> Result<(Id, Id, String, ([[Id; 4]; N_KINDS], [Id; N_KINDS], [Id; N_KINDS], Id, Id, Id, Id), Id, [Id; N_BUFS]), String> {
+    unsafe fn init(
+        o: &Objc,
+        copy_all_devices: unsafe extern "C" fn() -> Id,
+        weights: &'static [u8],
+        state: &State,
+    ) -> Result<(Id, Id, String, ([[Id; 4]; N_KINDS], [Id; N_KINDS], [Id; N_KINDS], Id, Id, Id, Id, [[Id; 3]; N_KINDS]), Id, [Id; N_BUFS]), String> {
         // MTLCopyAllDevices is several times faster than
         // MTLCreateSystemDefaultDevice (which talks to the window server).
         let devices = copy_all_devices();
@@ -434,16 +453,20 @@ impl Gpu {
             Ok(p)
         };
         let mut pso_mv = [[null_mut(); 4]; N_KINDS];
+        let mut pso_mv3 = [[null_mut(); 3]; N_KINDS];
         let mut pso_mm = [null_mut(); N_KINDS];
         let mut pso_gate = [null_mut(); N_KINDS];
         for (i, n) in KIND_NAMES.iter().enumerate() {
             for (j, nr) in [1, 2, 4, 8].iter().enumerate() {
                 pso_mv[i][j] = pipeline(&format!("mv{nr}_{n}"))?;
             }
+            for (j, nr) in [1, 2, 4].iter().enumerate() {
+                pso_mv3[i][j] = pipeline(&format!("mv3x{nr}_{n}"))?;
+            }
             pso_mm[i] = pipeline(&format!("mm_{n}"))?;
             pso_gate[i] = pipeline(&format!("mvgate_{n}"))?;
         }
-        let psos = (pso_mv, pso_mm, pso_gate, pipeline("kernel_rmsnorm")?, pipeline("kernel_rope")?, pipeline("kernel_attention")?, pipeline("kernel_silu_mul")?);
+        let psos = (pso_mv, pso_mm, pso_gate, pipeline("kernel_rmsnorm")?, pipeline("kernel_rope")?, pipeline("kernel_attention")?, pipeline("kernel_silu_mul")?, pso_mv3);
 
         // Weights and activations, without copying.
         let no_copy = o.sel("newBufferWithBytesNoCopy:length:options:deallocator:");
@@ -630,6 +653,58 @@ impl Gpu {
             self.set_buf(self.bufs[opts.rope.unwrap_or(src) as usize], 0, 4);
             self.set_buf(self.wbuf, opts.bias.map(|b| b.off).unwrap_or(0), 5);
             self.dispatch(groups, 1, MM_THREADS);
+        }
+    }
+
+    /// The q / k / v projections of one vector in a single dispatch: three
+    /// matrices of the same format (`ws`) against `src`, written to `dsts`
+    /// (buffer, element offset). `rope` rotates the outputs of the first two
+    /// (Llama layout; needs `d`); `biases` are added per matrix. Falls back
+    /// to three [`Gpu::mv`] calls when the formats differ or a row count is
+    /// not a multiple of the rows-per-simdgroup choice.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mv3(&mut self, dsts: [(BufId, usize); 3], ws: [&Tensor; 3], src: BufId, d: Option<&Dims>, rope: Option<BufId>, biases: [Option<&Tensor>; 3]) {
+        let kind = ws[0].kind;
+        let nr = self.mv_rows(kind, rope.is_some()).min(4);
+        let same = ws.iter().all(|w| w.kind == kind && w.cols == ws[0].cols);
+        if !same || ws.iter().any(|w| !w.rows.is_multiple_of(nr)) {
+            for i in 0..3 {
+                let r = if i < 2 { rope } else { None };
+                self.mv(dsts[i].0, dsts[i].1, ws[i], src, 0, if r.is_some() { d } else { None }, MvOpts { rope: r, bias: biases[i], ..MvOpts::default() });
+            }
+            return;
+        }
+        let (head_dim, rot_dim) = match (rope, d) {
+            (Some(_), Some(d)) => (d.head_dim as u32, d.rot_dim as u32),
+            (Some(_), None) => panic!("rope needs the model dimensions"),
+            _ => (1, 0),
+        };
+        let total = ws[0].rows + ws[1].rows + ws[2].rows;
+        let args = Mv3Args {
+            cols: ws[0].cols as u32,
+            rows0: ws[0].rows as u32,
+            rows1: ws[1].rows as u32,
+            rows2: ws[2].rows as u32,
+            rope: if rope.is_some() { 0b011 } else { 0 },
+            head_dim,
+            rot_dim,
+            bias: biases.iter().enumerate().map(|(i, b)| (b.is_some() as u32) << i).sum(),
+        };
+        unsafe {
+            self.set_pipeline(self.pso_mv3[kind_idx(kind)][nr.trailing_zeros() as usize]);
+            self.set_buf(self.wbuf, ws[0].off, 0);
+            self.set_buf(self.bufs[src as usize], 0, 1);
+            self.set_buf(self.bufs[dsts[0].0 as usize], dsts[0].1 * 4, 2);
+            self.set_args(&args, 3);
+            self.set_buf(self.bufs[rope.unwrap_or(src) as usize], 0, 4);
+            self.set_buf(self.wbuf, biases[0].map(|b| b.off).unwrap_or(0), 5);
+            self.set_buf(self.wbuf, ws[1].off, 6);
+            self.set_buf(self.wbuf, ws[2].off, 7);
+            self.set_buf(self.bufs[dsts[1].0 as usize], dsts[1].1 * 4, 8);
+            self.set_buf(self.bufs[dsts[2].0 as usize], dsts[2].1 * 4, 9);
+            self.set_buf(self.wbuf, biases[1].map(|b| b.off).unwrap_or(0), 10);
+            self.set_buf(self.wbuf, biases[2].map(|b| b.off).unwrap_or(0), 11);
+            self.dispatch(total.div_ceil(4 * nr), 1, MM_THREADS);
         }
     }
 

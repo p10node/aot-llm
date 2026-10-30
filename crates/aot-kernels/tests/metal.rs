@@ -278,6 +278,78 @@ fn fused_decode_kernels_match_separate_ops() {
     }
 }
 
+/// The fused q / k / v dispatch gives the same results as three products.
+#[test]
+fn fused_qkv_matches_three_products() {
+    let mut rng = Rng(0x3333);
+    let d = Dims {
+        dim: 512,
+        hidden: 1024,
+        n_layer: 1,
+        n_head: 4,
+        n_kv_head: 2,
+        head_dim: 64,
+        rot_dim: 64,
+        vocab: 16,
+        n_ctx_train: 64,
+        eps: 1e-5,
+        rope_base: 10000.0,
+        rope_scale: 1.0,
+        swa_window: 0,
+        rope_base_local: 10000.0,
+        rope_scale_local: 1.0,
+    };
+    for kind in [Kind::Q4_K, Kind::Q6_K, Kind::Q5_0, Kind::Q8_0, Kind::F16] {
+        let mut blob = Vec::new();
+        let mut mk = |rng: &mut Rng, rows: usize, cols: usize, k: Kind| -> Tensor {
+            while blob.len() % 32 != 0 {
+                blob.push(0);
+            }
+            let off = blob.len();
+            for _ in 0..rows {
+                let mut row = vec![0f32; cols];
+                rng.fill(&mut row, 0.5);
+                blob.extend_from_slice(&quantize_row(k, &row));
+            }
+            Tensor { name: "w", kind: k, off, len: blob.len() - off, rows, cols }
+        };
+        let wq = mk(&mut rng, d.q_dim(), d.dim, kind);
+        let wk = mk(&mut rng, d.kv_dim(), d.dim, kind);
+        let wv = mk(&mut rng, d.kv_dim(), d.dim, kind);
+        let bq = mk(&mut rng, 1, d.q_dim(), Kind::F32);
+        let bk = mk(&mut rng, 1, d.kv_dim(), Kind::F32);
+        let w = weights_blob(&blob);
+        let mut state = State::new(&d, 64, None, 1, 1);
+        let Some(mut gpu) = gpu_or_skip(w, &state, &d) else { return };
+        rng.fill(&mut state.xb, 1.0);
+        ops::rope_cos_sin(&mut state.rope_cs, &state.inv_freq, 17.0);
+        let kv_at = 3 * d.kv_dim();
+        for rope in [false, true] {
+            let r = if rope { Some(BufId::RopeCs) } else { None };
+            let dd = if rope { Some(&d) } else { None };
+            gpu.begin();
+            gpu.mv(BufId::Q, 0, &wq, BufId::Xb, 0, dd, MvOpts { rope: r, bias: Some(&bq), ..MvOpts::default() });
+            gpu.mv(BufId::KCache, kv_at, &wk, BufId::Xb, 0, dd, MvOpts { rope: r, bias: Some(&bk), ..MvOpts::default() });
+            gpu.mv(BufId::VCache, kv_at, &wv, BufId::Xb, 0, None, MvOpts::default());
+            gpu.finish();
+            let q_ref: Vec<f64> = state.q.iter().map(|&v| v as f64).collect();
+            let k_ref: Vec<f64> = state.k_cache[kv_at..kv_at + d.kv_dim()].iter().map(|&v| v as f64).collect();
+            let v_ref: Vec<f64> = state.v_cache[kv_at..kv_at + d.kv_dim()].iter().map(|&v| v as f64).collect();
+            state.q.fill(0.0);
+            state.k_cache[kv_at..kv_at + d.kv_dim()].fill(0.0);
+            state.v_cache[kv_at..kv_at + d.kv_dim()].fill(0.0);
+            gpu.begin();
+            gpu.mv3([(BufId::Q, 0), (BufId::KCache, kv_at), (BufId::VCache, kv_at)], [&wq, &wk, &wv], BufId::Xb, dd, r, [Some(&bq), Some(&bk), None]);
+            gpu.finish();
+            let (eq, sq) = max_err(&state.q, &q_ref);
+            let (ek, sk) = max_err(&state.k_cache[kv_at..kv_at + d.kv_dim()], &k_ref);
+            let (ev, sv) = max_err(&state.v_cache[kv_at..kv_at + d.kv_dim()], &v_ref);
+            eprintln!("{} rope={rope}: mv3 err q {eq:.2e} k {ek:.2e} v {ev:.2e}", kind.name());
+            assert!(eq <= 1e-5 * sq + 1e-6 && ek <= 1e-5 * sk + 1e-6 && ev <= 1e-5 * sv + 1e-6, "{}: fused qkv differs", kind.name());
+        }
+    }
+}
+
 /// Sliding-window attention, GeGLU and the accumulating RMSNorm (Gemma 3).
 #[test]
 fn window_gelu_and_norm_add_match_cpu() {

@@ -22,6 +22,15 @@ struct MmArgs {
     uint bias;        // 1: add bias[row] to every output row (projection biases)
     uint gelu;        // gate kernel: 1 = gelu(gate) * up (Gemma), 0 = silu(gate) * up
 };
+/// Three matrix-vector products sharing one input (the q / k / v projections)
+/// in one dispatch: the simdgroups are spread over the concatenated rows.
+struct Mv3Args {
+    uint cols;
+    uint rows0, rows1, rows2;
+    uint rope;        // bit i: rotate the output pairs of matrix i (Llama q / k)
+    uint head_dim, rot_dim;
+    uint bias;        // bit i: add bias_i[row] to matrix i
+};
 struct NormArgs { uint n; uint m; float eps; uint accumulate; };
 struct RopeArgs { uint m; uint n_head; uint n_kv_head; uint head_dim; uint rot_dim; uint q_stride; uint k_stride; uint neox; };
 struct AttnArgs { uint m; uint pos0; uint n_head; uint gqa; uint head_dim; uint kv_dim; uint q_stride; uint ctx; float scale; uint window; };
@@ -559,6 +568,73 @@ kernel void kernel_mv(
     }
 }
 
+// Fused q / k / v: like kernel_mv over three matrices of the same format.
+// Each simdgroup's NR rows lie inside one matrix (the host checks that every
+// row count is a multiple of NR), so matrix selection is per simdgroup.
+template <typename Q, int NR>
+kernel void kernel_mv3(
+    device const uchar* w0 [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y0 [[buffer(2)]],
+    constant Mv3Args& a [[buffer(3)]],
+    device const float* cs [[buffer(4)]],
+    device const float* b0 [[buffer(5)]],
+    device const uchar* w1 [[buffer(6)]],
+    device const uchar* w2 [[buffer(7)]],
+    device float* y1 [[buffer(8)]],
+    device float* y2 [[buffer(9)]],
+    device const float* b1 [[buffer(10)]],
+    device const float* b2 [[buffer(11)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint row0 = (tgpig.x * 4 + sgitg) * NR;
+    if (row0 >= a.rows0 + a.rows1 + a.rows2) return;
+    uint mat = 0;
+    uint rows = a.rows0;
+    device const uchar* w = w0;
+    device float* y = y0;
+    device const float* bias = b0;
+    if (row0 >= a.rows0 + a.rows1) {
+        mat = 2; row0 -= a.rows0 + a.rows1; rows = a.rows2; w = w2; y = y2; bias = b2;
+    } else if (row0 >= a.rows0) {
+        mat = 1; row0 -= a.rows0; rows = a.rows1; w = w1; y = y1; bias = b1;
+    }
+    const uint row_bytes = a.cols / Q::BLOCK * Q::BLOCK_BYTES;
+    const uint lane_elem = Q::lane_elem(tiisg);
+    float sums[NR];
+    for (int i = 0; i < NR; i++) sums[i] = 0.0f;
+    for (uint base = 0; base + lane_elem < a.cols; base += Q::ITER) {
+        const uint elem = base + lane_elem;
+        typename Q::W wv[NR];
+        for (int i = 0; i < NR; i++) wv[i] = Q::load(w + min(row0 + i, rows - 1) * row_bytes, elem);
+        float4 xv[Q::NX];
+        for (uint k = 0; k < Q::NX; k++) xv[k] = *(device const float4*)(x + base + Q::x_off(tiisg, k));
+        for (int i = 0; i < NR; i++) sums[i] += Q::dot(wv[i], xv);
+    }
+    float v[NR];
+    for (int i = 0; i < NR; i++) v[i] = simd_sum(sums[i]);
+    if (tiisg != 0) return;
+    if ((a.bias >> mat) & 1u) {
+        for (int i = 0; i < NR; i++) v[i] += bias[min(row0 + i, rows - 1)];
+    }
+    if ((a.rope >> mat) & 1u) {
+        for (int i = 0; i + 1 < NR; i += 2) {
+            const uint dim = (row0 + i) % a.head_dim;
+            if (dim < a.rot_dim) {
+                const float c = cs[dim], sn = cs[dim + 1];
+                const float x0 = v[i], x1 = v[i + 1];
+                v[i] = x0 * c - x1 * sn;
+                v[i + 1] = x0 * sn + x1 * c;
+            }
+        }
+    }
+    for (int i = 0; i < NR; i++) {
+        if (row0 + i < rows) y[row0 + i] = v[i];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Batched product, y[t][row] (+)= sum_c W[row][c] * x[t][c] for t < m
 // (prompt processing): a tiled GEMM on the simdgroup matrix units.
@@ -681,6 +757,7 @@ kernel void kernel_mv_gate(
 }
 
 typedef decltype(kernel_mv<Q4K, 4>) mv_t;
+typedef decltype(kernel_mv3<Q4K, 4>) mv3_t;
 typedef decltype(kernel_mm<Q4K>) mm_t;
 typedef decltype(kernel_mv_gate<Q4K>) mv_gate_t;
 
@@ -689,6 +766,9 @@ typedef decltype(kernel_mv_gate<Q4K>) mv_gate_t;
     template [[host_name("mv2_" name)]] kernel mv_t kernel_mv<Q, 2>; \
     template [[host_name("mv4_" name)]] kernel mv_t kernel_mv<Q, 4>; \
     template [[host_name("mv8_" name)]] kernel mv_t kernel_mv<Q, 8>; \
+    template [[host_name("mv3x1_" name)]] kernel mv3_t kernel_mv3<Q, 1>; \
+    template [[host_name("mv3x2_" name)]] kernel mv3_t kernel_mv3<Q, 2>; \
+    template [[host_name("mv3x4_" name)]] kernel mv3_t kernel_mv3<Q, 4>; \
     template [[host_name("mm_" name)]] kernel mm_t kernel_mm<Q>; \
     template [[host_name("mvgate_" name)]] kernel mv_gate_t kernel_mv_gate<Q>;
 

@@ -18,6 +18,7 @@ use aot_gguf::{GgmlType, GgufFile, MetaValue};
 use aot_kernels::quant::{dequant_row, quantize_q8_0, quantize_q8_k, Kind};
 use aot_kernels::quantize::quantize_row;
 use aot_kernels::tokenizer::Tokenizer;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -26,6 +27,9 @@ const HIDDEN: usize = 512;
 const EPS: f32 = 1e-5;
 /// RoPE base of the local (sliding-window) layers; llama.cpp hardcodes it for Gemma 3.
 const LOCAL_ROPE_BASE: f32 = 10000.0;
+/// A quantized activation this close (relative) to a rounding boundary is a
+/// tie: the binary's float noise against the reference is ~2e-7.
+const TIE: f32 = 1e-5;
 
 /// Architecture variant under test.
 #[derive(Clone, Copy)]
@@ -127,30 +131,66 @@ fn mat(rng: &mut Rng, rows: usize, cols: usize, kind: Kind, amp: f32) -> Mat {
     Mat { rows, cols, f32: f32v, kind, bytes }
 }
 
+/// A quantized activation: (Q8_K rather than Q8_0, index in the vector, f32 bits).
+/// The runtime quantizes a vector once for all the matmuls that read it, so
+/// the key names the value, not the matmul.
+type TieKey = (bool, usize, u32);
+
+/// How the reference feeds activations to a matmul.
+struct Acts {
+    /// Apply the CPU path's activation quantization (the GPU path multiplies
+    /// f32 activations directly).
+    quant: bool,
+    /// Quantized activations seen within `TIE` of a rounding boundary.
+    ties: RefCell<Vec<TieKey>>,
+    /// Round this one to the other neighbouring level.
+    flip: Option<TieKey>,
+}
+
+impl Acts {
+    fn new(quant: bool, flip: Option<TieKey>) -> Self {
+        Acts { quant, ties: RefCell::new(Vec::new()), flip }
+    }
+}
+
 /// Quantize the activation vector exactly like the runtime does before a
 /// matmul with weights of `kind`, then dequantize it back to f32. This makes
-/// the reference bit-for-bit comparable (up to float summation order).
-fn act_quant(kind: Kind, x: &[f32]) -> Vec<f32> {
-    match kind {
+/// the reference bit-for-bit comparable, up to float summation order and the
+/// ties that order can tip (see `check_quant_logits`).
+fn act_quant(kind: Kind, x: &[f32], acts: &Acts) -> Vec<f32> {
+    let qd: Vec<(i8, f32)> = match kind {
         Kind::Q4_0 | Kind::Q5_0 | Kind::Q8_0 => {
             let mut b = Vec::new();
             quantize_q8_0(x, &mut b);
-            b.iter().flat_map(|blk| blk.qs.iter().map(move |&q| q as f32 * blk.d)).collect()
+            b.iter().flat_map(|blk| blk.qs.iter().map(move |&q| (q, blk.d))).collect()
         }
         Kind::Q4_K | Kind::Q5_K | Kind::Q6_K => {
             let mut b = Vec::new();
             quantize_q8_k(x, &mut b);
-            b.iter().flat_map(|blk| blk.qs.iter().map(move |&q| q as f32 * blk.d)).collect()
+            b.iter().flat_map(|blk| blk.qs.iter().map(move |&q| (q, blk.d))).collect()
         }
-        _ => x.to_vec(),
-    }
+        _ => return x.to_vec(),
+    };
+    let k_format = matches!(kind, Kind::Q4_K | Kind::Q5_K | Kind::Q6_K);
+    x.iter()
+        .zip(qd)
+        .enumerate()
+        .map(|(i, (&v, (q, d)))| {
+            let key = (k_format, i, v.to_bits());
+            let t = v / d;
+            if d != 0.0 && (t - t.floor() - 0.5).abs() < TIE * t.abs().max(1.0) && !acts.ties.borrow().contains(&key) {
+                acts.ties.borrow_mut().push(key);
+            }
+            let q = q as i32;
+            let q = if acts.flip == Some(key) { (if t > q as f32 { q + 1 } else { q - 1 }).clamp(-127, 127) } else { q };
+            q as f32 * d
+        })
+        .collect()
 }
 
-/// `quant_acts`: apply the CPU path's activation quantization (the GPU path
-/// multiplies f32 activations directly).
-fn matvec(m: &Mat, x: &[f32], quant_acts: bool) -> Vec<f32> {
+fn matvec(m: &Mat, x: &[f32], acts: &Acts) -> Vec<f32> {
     assert_eq!(x.len(), m.cols);
-    let xq = if quant_acts { act_quant(m.kind, x) } else { x.to_vec() };
+    let xq = if acts.quant { act_quant(m.kind, x, acts) } else { x.to_vec() };
     (0..m.rows).map(|r| (0..m.cols).map(|c| m.f32[r * m.cols + c] * xq[c]).sum()).collect()
 }
 
@@ -217,7 +257,7 @@ struct Model {
 }
 
 /// Reference forward over a token sequence; returns logits of the last token.
-fn reference_logits(m: &Model, tokens: &[u32], quant_acts: bool) -> Vec<f32> {
+fn reference_logits(m: &Model, tokens: &[u32], acts: &Acts) -> Vec<f32> {
     let cfg = &m.cfg;
     let hd = cfg.head_dim;
     let kv_dim = cfg.kv_dim();
@@ -237,9 +277,9 @@ fn reference_logits(m: &Model, tokens: &[u32], quant_acts: bool) -> Vec<f32> {
             let (base, scale) = if local { (LOCAL_ROPE_BASE, 1.0) } else { (cfg.rope_base, cfg.rope_scale) };
             let t_start = if local && pos + 1 > cfg.swa_window { pos + 1 - cfg.swa_window } else { 0 };
             let xb = rmsnorm(&x, &l.attn_norm);
-            let mut q = matvec(&l.wq, &xb, quant_acts);
-            let mut k = matvec(&l.wk, &xb, quant_acts);
-            let mut v = matvec(&l.wv, &xb, quant_acts);
+            let mut q = matvec(&l.wq, &xb, acts);
+            let mut k = matvec(&l.wk, &xb, acts);
+            let mut v = matvec(&l.wv, &xb, acts);
             if let (Some(bq), Some(bk), Some(bv)) = (&l.bq, &l.bk, &l.bv) {
                 add(&mut q, bq);
                 add(&mut k, bk);
@@ -276,18 +316,18 @@ fn reference_logits(m: &Model, tokens: &[u32], quant_acts: bool) -> Vec<f32> {
                     }
                 }
             }
-            let o = matvec(&l.wo, &att, quant_acts);
+            let o = matvec(&l.wo, &att, acts);
             let o = match &l.attn_post_norm {
                 Some(w) => rmsnorm(&o, w),
                 None => o,
             };
             add(&mut x, &o);
             let xb = rmsnorm(&x, &l.ffn_norm);
-            let g = matvec(&l.gate, &xb, quant_acts);
-            let u = matvec(&l.up, &xb, quant_acts);
+            let g = matvec(&l.gate, &xb, acts);
+            let u = matvec(&l.up, &xb, acts);
             let hbuf: Vec<f32> =
                 if cfg.gemma { g.iter().zip(&u).map(|(g, u)| 0.5 * g * (1.0 + (0.797_884_6f32 * (g + 0.044715 * g * g * g)).tanh()) * u).collect() } else { g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect() };
-            let d = matvec(&l.down, &hbuf, quant_acts);
+            let d = matvec(&l.down, &hbuf, acts);
             let d = match &l.ffn_post_norm {
                 Some(w) => rmsnorm(&d, w),
                 None => d,
@@ -296,7 +336,7 @@ fn reference_logits(m: &Model, tokens: &[u32], quant_acts: bool) -> Vec<f32> {
         }
         if pos + 1 == tokens.len() {
             let xb = rmsnorm(&x, &m.output_norm);
-            logits = matvec(&m.output, &xb, quant_acts);
+            logits = matvec(&m.output, &xb, acts);
         }
     }
     logits
@@ -453,8 +493,47 @@ fn check_logits(label: &str, got: &[f32], expected: &[f32]) {
     eprintln!("{label}: max |logit| {max_abs:.3}, max abs error {max_err:.4}, argmax {} vs {}", argmax(got), argmax(expected));
     // The reference applies the same activation quantization, so only float
     // summation-order noise remains.
-    assert!(max_err <= 2e-3 * max_abs + 1e-3, "{label}: logits differ: max error {max_err} (range {max_abs})");
+    assert!(max_err <= tolerance(expected), "{label}: logits differ: max error {max_err} (range {max_abs})");
     assert_eq!(argmax(got), argmax(expected), "{label}: argmax differs");
+}
+
+fn tolerance(expected: &[f32]) -> f32 {
+    2e-3 * expected.iter().fold(0f32, |m, v| m.max(v.abs())) + 1e-3
+}
+
+/// Logits of the quantized-activation reference, and how they change when
+/// each of its near-tie activations rounds the other way.
+struct QuantRef {
+    logits: Vec<f32>,
+    flips: Vec<Vec<f32>>,
+}
+
+fn quant_reference(m: &Model, tokens: &[u32]) -> QuantRef {
+    let acts = Acts::new(true, None);
+    let logits = reference_logits(m, tokens, &acts);
+    let flips = acts.ties.into_inner().into_iter().map(|t| reference_logits(m, tokens, &Acts::new(true, Some(t))).iter().zip(&logits).map(|(a, b)| a - b).collect()).collect();
+    QuantRef { logits, flips }
+}
+
+/// Compare CPU logits against the quantized-activation reference.
+///
+/// Quantizing an activation is discontinuous: one within float noise of a
+/// rounding boundary can land on neighbouring levels in the binary and in the
+/// reference, which sum in different orders, and in these tiny random models
+/// a single such flip moves the logits by a few percent of their range
+/// (x86-64 Qwen2: 0.089 of 6.4, a Q8_K value at 4.4999995 vs 4.5000005). A
+/// deviation must therefore be explained by rounding at most two near-tie
+/// activations the other way (the fewest that do); the remainder is held to
+/// the usual tolerance.
+fn check_quant_logits(label: &str, got: &[f32], r: &QuantRef) {
+    let expected = |flipped: &[usize]| -> Vec<f32> { r.logits.iter().enumerate().map(|(v, l)| l + flipped.iter().map(|&i| r.flips[i][v]).sum::<f32>()).collect() };
+    let fits = |e: &[f32]| {
+        let tol = tolerance(e);
+        got.iter().zip(e).all(|(a, b)| (a - b).abs() <= tol)
+    };
+    let n = r.flips.len();
+    let flipped = std::iter::once(vec![]).chain((0..n).map(|i| vec![i])).chain((0..n).flat_map(|i| (i + 1..n).map(move |j| vec![i, j]))).find(|c| fits(&expected(c))).unwrap_or_default();
+    check_logits(&format!("{label} ({} of {n} near-tie activations flipped)", flipped.len()), got, &expected(&flipped));
 }
 
 fn parse_logits(out: &std::process::Output) -> Vec<f32> {
@@ -483,7 +562,7 @@ fn compile_run_and_match_reference(cfg: Cfg) {
     let prompt = vec!["the capital of hello world is"; repeat].join(" ");
     let ids = tok.encode(&prompt, true, true);
     assert_eq!(ids.len(), 1 + 6 * repeat, "{ids:?}");
-    let expected = reference_logits(&model, &ids, true);
+    let expected = quant_reference(&model, &ids);
 
     let status = Command::new(env!("CARGO_BIN_EXE_aot-llm")).args(["compile", "--model"]).arg(&gguf_path).arg("--output").arg(&out).arg("--quiet").status().expect("running aot-llm");
     assert!(status.success(), "aot-llm compile failed");
@@ -491,7 +570,7 @@ fn compile_run_and_match_reference(cfg: Cfg) {
     // Both prompt paths (token by token and batched) must match the reference.
     for batch in ["1", "128"] {
         let run = Command::new(&out).args(["--prompt", &prompt, "--dump-logits", "--quiet", "--batch", batch]).output().expect("running compiled binary");
-        check_logits(&format!("{} cpu batch {batch}", cfg.arch), &parse_logits(&run), &expected);
+        check_quant_logits(&format!("{} cpu batch {batch}", cfg.arch), &parse_logits(&run), &expected);
     }
 
     // Generation runs and stops cleanly.
@@ -507,7 +586,7 @@ fn compile_run_and_match_reference(cfg: Cfg) {
         let out_gpu = tmp.join("tiny_gpu");
         let status = Command::new(env!("CARGO_BIN_EXE_aot-llm")).args(["compile", "--model"]).arg(&gguf_path).arg("--output").arg(&out_gpu).args(["--quiet", "--gpu", "metal"]).status().expect("running aot-llm");
         assert!(status.success(), "aot-llm compile --gpu metal failed");
-        let expected = reference_logits(&model, &ids, false);
+        let expected = reference_logits(&model, &ids, &Acts::new(false, None));
         for batch in ["1", "128"] {
             let run = Command::new(&out_gpu).args(["--prompt", &prompt, "--dump-logits", "--quiet", "--batch", batch, "--device", "gpu"]).output().expect("running compiled binary");
             let stderr = String::from_utf8_lossy(&run.stderr);
@@ -652,7 +731,7 @@ fn lib_c_api_matches_reference() {
     let tok = Tokenizer::new(Box::leak(blob.into_boxed_slice())).unwrap();
     let prompt = "the capital of hello world is";
     let ids = tok.encode(prompt, true, true);
-    let expected = reference_logits(&model, &ids, true);
+    let expected = quant_reference(&model, &ids);
 
     let kv_path = tmp.join("client.kv");
     let run = Command::new(&exe).arg(prompt).arg(&kv_path).output().expect("running the C client");
@@ -662,9 +741,9 @@ fn lib_c_api_matches_reference() {
     let toks: Vec<u32> = lines.next().unwrap().strip_prefix("TOKENS ").unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
     assert_eq!(toks, ids, "C tokenizer differs");
     let got: Vec<f32> = lines.next().unwrap().strip_prefix("LOGITS ").unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
-    check_logits("lib batched", &got, &expected);
+    check_quant_logits("lib batched", &got, &expected);
     let got1: Vec<f32> = lines.next().unwrap().strip_prefix("LOGITS1 ").unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
-    check_logits("lib token by token", &got1, &expected);
+    check_quant_logits("lib token by token", &got1, &expected);
     let got2: Vec<f32> = lines.next().unwrap().strip_prefix("LOGITS2 ").unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
     assert_eq!(got2, got, "logits after aot_ctx_save / aot_ctx_load differ");
     let gen = lines.next().unwrap();

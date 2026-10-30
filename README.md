@@ -60,7 +60,7 @@ aot-llm is about **first-response latency and packaging**, not raw throughput. S
 
 ## Quick start
 
-Requirements: Rust 1.98+ (the kernels use `vdotq_s32`), a GGUF of a supported architecture: Llama (TinyLlama, Llama 2/3/3.2, Mistral 7B, ...), Qwen2/2.5, Qwen3 or Phi-3 (4k-context variants).
+Requirements: Rust 1.98+ (the kernels use `vdotq_s32`), a GGUF of a supported architecture: Llama (TinyLlama, Llama 2/3/3.2, Mistral 7B, ...), Qwen2/2.5, Qwen3, Phi-3 (4k-context variants) or Gemma 3. `--model` also takes `hf://org/repo:QUANT` (or `hf://org/repo/file.gguf`): the file is downloaded once into `~/.cache/aot-llm` (`HF_TOKEN` for gated repositories).
 
 ```bash
 git clone https://github.com/p10node/aot-llm && cd aot-llm
@@ -86,10 +86,10 @@ cargo build --release
 ./llama32 --chat --system "You are a concise assistant. Answer in one short paragraph." --prompt "Why is the sky blue?"   # uses the baked prefix
 ./llama32 --info
 
-# Qwen3 (answers directly by default; --think lets it reason first) and Qwen2.5
-./target/release/aot-llm compile --model ./Qwen3-0.6B-Q4_K_M.gguf --output ./qwen3 --gpu metal
+# Qwen3 (answers directly by default; --think lets it reason first), straight from the Hub
+./target/release/aot-llm compile --model hf://unsloth/Qwen3-0.6B-GGUF:Q4_K_M --output ./qwen3 --gpu metal
 ./qwen3 --chat --prompt "Write one sentence about the moon."
-./target/release/aot-llm compile --model ./qwen2.5-0.5b-instruct-q4_k_m.gguf --output ./qwen25
+./target/release/aot-llm compile --model hf://unsloth/gemma-3-1b-it-GGUF:Q4_K_M --output ./gemma1b
 
 # A C library instead of an executable (see examples/c/main.c, examples/python/)
 ./target/release/aot-llm compile --model ./Qwen3-0.6B-Q4_K_M.gguf --output ./libqwen3 --lib --name qwen3
@@ -135,7 +135,7 @@ Generated binary options:
     --info               Print model information and exit
 ```
 
-Compiler options (`aot-llm compile --help`): `--lib [static|shared]` (build a model library with the C API instead of an executable; `--output` is then a directory), `--symbol-prefix PFX` (prefix the library's C symbols and header names so several models can be linked into one program), `--gpu metal` (compile the Metal backend in, macOS only), `--system TEXT` / `--prefix TEXT` (bake a KV prefix cache), `--target <triple>`, `--native` (`-C target-cpu=native`), `--sidecar`, `--emit-only` (generate the project without building), `--build-dir`, `--name`, `-j`, `-q`.
+Compiler options (`aot-llm compile --help`): `--model PATH|hf://org/repo[:QUANT|/file.gguf]`, `--lib [static|shared]` (build a model library with the C API instead of an executable; `--output` is then a directory), `--symbol-prefix PFX` (prefix the library's C symbols and header names so several models can be linked into one program), `--gpu metal` (compile the Metal backend in, macOS only), `--system TEXT` / `--prefix TEXT` (bake a KV prefix cache), `--target <triple>`, `--native` (`-C target-cpu=native`), `--sidecar`, `--emit-only` (generate the project without building), `--build-dir`, `--name`, `-j`, `-q`.
 
 Debugging: `AOT_DEBUG_COMPARE=1 ./bin ...` re-evaluates the prompt token by token and reports the first KV-cache divergence from the batched path; `--dump-logits` prints the logits of the last prompt token.
 

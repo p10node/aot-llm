@@ -10,6 +10,8 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+mod hub;
+
 #[derive(Parser)]
 #[command(name = "aot-llm", version, about = "Ahead-of-time compiler for GGUF LLMs: one model in, one native executable out")]
 struct Cli {
@@ -22,9 +24,11 @@ struct Cli {
 enum Cmd {
     /// Compile a GGUF model into a standalone executable.
     Compile {
-        /// Path to the quantized GGUF model.
+        /// Path to the quantized GGUF model, or `hf://org/repo:QUANT`
+        /// (`hf://Qwen/Qwen3-0.6B-GGUF:Q4_K_M`) / `hf://org/repo/file.gguf`
+        /// to download it from the Hugging Face Hub into ~/.cache/aot-llm.
         #[arg(short, long)]
-        model: PathBuf,
+        model: String,
         /// Output executable path.
         #[arg(short, long)]
         output: PathBuf,
@@ -78,9 +82,9 @@ enum Cmd {
         #[arg(long, value_name = "PREFIX", requires = "lib")]
         symbol_prefix: Option<String>,
     },
-    /// Print metadata and tensors of a GGUF file.
+    /// Print metadata and tensors of a GGUF file (path or hf:// reference).
     Inspect {
-        model: PathBuf,
+        model: String,
         /// List every tensor.
         #[arg(long)]
         tensors: bool,
@@ -90,7 +94,7 @@ enum Cmd {
     },
     /// Tokenize text with a model's vocabulary (debugging aid).
     Tokenize {
-        model: PathBuf,
+        model: String,
         #[arg(short, long)]
         text: String,
         /// Do not prepend BOS.
@@ -106,10 +110,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Compile { model, output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix, gpu, lib, symbol_prefix } => {
+            let model = hub::resolve_model(&model, quiet)?;
             compile(&model, &output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix, gpu, lib, symbol_prefix)
         }
-        Cmd::Inspect { model, tensors, metadata } => inspect(&model, tensors, metadata),
-        Cmd::Tokenize { model, text, no_bos, chat } => tokenize(&model, &text, no_bos, chat),
+        Cmd::Inspect { model, tensors, metadata } => inspect(&hub::resolve_model(&model, false)?, tensors, metadata),
+        Cmd::Tokenize { model, text, no_bos, chat } => tokenize(&hub::resolve_model(&model, false)?, &text, no_bos, chat),
     }
 }
 

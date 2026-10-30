@@ -735,7 +735,7 @@ pub fn emit_payload_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     let len = spec.data_len;
     writeln!(o, "pub const SIDECAR: bool = false;\n").unwrap();
     writeln!(o, "/// The tensor data section of the GGUF file is placed verbatim in a").unwrap();
-    writeln!(o, "/// read-only section of this executable with the assembler's `.incbin`").unwrap();
+    writeln!(o, "/// section of this executable with the assembler's `.incbin`").unwrap();
     writeln!(o, "/// directive. The OS loader maps the section lazily: starting the binary").unwrap();
     writeln!(o, "/// costs no I/O and weights are paged in on first touch (zero-copy).").unwrap();
     writeln!(o, "pub const WEIGHTS_LEN: usize = {len};\n").unwrap();
@@ -754,16 +754,26 @@ pub fn emit_payload_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "    \".incbin \\\"{path}\\\", {skip}, {len}\",").unwrap();
     writeln!(o, "    \".balign {align}\",").unwrap();
     writeln!(o, ");\n").unwrap();
-    writeln!(o, "#[cfg(not(target_os = \"macos\"))]").unwrap();
-    writeln!(o, "std::arch::global_asm!(").unwrap();
-    writeln!(o, "    \".section .rodata.aot_weights,\\\"a\\\",@progbits\",").unwrap();
-    writeln!(o, "    \".balign 64\",").unwrap();
-    writeln!(o, "    \".globl aot_weights_start\",").unwrap();
-    writeln!(o, "    \"aot_weights_start:\",").unwrap();
-    writeln!(o, "    \".incbin \\\"{path}\\\", {skip}, {len}\",").unwrap();
-    writeln!(o, "    \".balign 64\",").unwrap();
-    writeln!(o, "    \".text\",").unwrap();
-    writeln!(o, ");\n").unwrap();
+    // ELF: a read-only section, except on x86-64 where the blob goes into a
+    // "large" data section (SHF_X86_64_LARGE, `.ldata`): the linker places
+    // those after `.bss`, so a model over 2 GB does not push the code and
+    // the small data more than 2 GB apart, which the 32-bit PC-relative
+    // relocations of the small code model cannot reach (the weights are
+    // only ever referenced through their start address).
+    for (cfg, section) in
+        [("all(not(target_os = \"macos\"), target_arch = \"x86_64\")", ".ldata.aot_weights,\\\"awl\\\",@progbits"), ("all(not(target_os = \"macos\"), not(target_arch = \"x86_64\"))", ".rodata.aot_weights,\\\"a\\\",@progbits")]
+    {
+        writeln!(o, "#[cfg({cfg})]").unwrap();
+        writeln!(o, "std::arch::global_asm!(").unwrap();
+        writeln!(o, "    \".section {section}\",").unwrap();
+        writeln!(o, "    \".balign 64\",").unwrap();
+        writeln!(o, "    \".globl aot_weights_start\",").unwrap();
+        writeln!(o, "    \"aot_weights_start:\",").unwrap();
+        writeln!(o, "    \".incbin \\\"{path}\\\", {skip}, {len}\",").unwrap();
+        writeln!(o, "    \".balign 64\",").unwrap();
+        writeln!(o, "    \".text\",").unwrap();
+        writeln!(o, ");\n").unwrap();
+    }
     writeln!(o, "extern \"C\" {{").unwrap();
     writeln!(o, "    static aot_weights_start: u8;").unwrap();
     writeln!(o, "}}\n").unwrap();
@@ -777,7 +787,7 @@ pub fn emit_payload_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
         writeln!(o, "        return Ok(m);").unwrap();
         writeln!(o, "    }}").unwrap();
     }
-    writeln!(o, "    // SAFETY: the symbol marks WEIGHTS_LEN bytes of read-only data placed").unwrap();
+    writeln!(o, "    // SAFETY: the symbol marks WEIGHTS_LEN bytes of data placed").unwrap();
     writeln!(o, "    // by the assembler directive above; it lives for the whole process.").unwrap();
     writeln!(o, "    Ok(unsafe {{ std::slice::from_raw_parts(std::ptr::addr_of!(aot_weights_start), WEIGHTS_LEN) }})").unwrap();
     writeln!(o, "}}").unwrap();

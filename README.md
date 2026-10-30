@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/p10node/aot-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/p10node/aot-llm/actions/workflows/ci.yml)
 
-Ahead-of-time compiler that turns a quantized GGUF model into **one native executable**, or into **one C library** (`--lib`): no runtime, no Python, no interpreter, no model file to load. The weights are placed in a read-only section of the binary, the OS maps them lazily, and the first forward pass starts about **0.2 ms** after `main()`. Llama, Qwen2/2.5, Qwen3 and Phi-3 models are supported.
+Ahead-of-time compiler that turns a quantized GGUF model into **one native executable**, or into **one C library** (`--lib`): no runtime, no Python, no interpreter, no model file to load. The weights are placed in a read-only section of the binary, the OS maps them lazily, and the first forward pass starts about **0.2 ms** after `main()`. Llama, Qwen2/2.5, Qwen3, Phi-3 and Gemma 3 models are supported; `--model hf://org/repo:Q4_K_M` fetches the GGUF from the Hugging Face Hub. Ready-made binaries for popular small models are published alongside the releases (see [Prebuilt model binaries](#prebuilt-model-binaries)).
 
 ```text
 $ aot-llm compile --model tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --output ./tinyllama_bin
@@ -205,7 +205,16 @@ Prompt tokens are processed by `forward_batch` in chunks: every weight row is lo
 | `crates/aot-kernels` | the runtime: quant layouts, SIMD matvec kernels, RMSNorm / RoPE / attention, thread pool, tokenizer, sampler, CLI driver, C API (`capi.rs`), Metal backend (`metal.rs`, `shaders.metal`). Copied verbatim into every generated project as `src/rt/` |
 | `crates/aot-codegen` | graph extraction (`ModelSpec`), tokenizer blob builder, Rust project emitter (binary or library), the C header (`aot_llm.h`), cargo driver                                             |
 | `crates/aot-llm`     | the `aot-llm` CLI: `compile`, `inspect`, `tokenize`                                                                                                                                 |
-| `examples/`          | `c/main.c` (the C API), `python/` (ctypes binding), `commit-msg/` (a git commit-message generator in one binary)                                                                     |
+| `examples/`          | `cookbook/` (classify, ask, summarize, extract, multi-turn chat, Python batch labelling), `c/main.c` (the C API), `python/` (ctypes binding), `commit-msg/` (a git commit-message generator in one binary) |
+| `scripts/`           | `bench.py` (benchmark harness), `release-binaries.sh` (build the prebuilt model binaries and upload them to the Hub)                                                                 |
+
+## Prebuilt model binaries
+
+`scripts/release-binaries.sh build` compiles a set of popular small models (Qwen3 0.6B / 1.7B, Qwen2.5 1.5B, Llama 3.2 1B / 3B, Gemma 3 1B, Phi-3 mini) for Apple Silicon (with the Metal backend) and as static x86_64 Linux executables; `scripts/release-binaries.sh upload ORG/REPO` publishes them to a Hugging Face model repository with a model card. Each file is one executable with the model inside: download, `chmod +x`, run `--chat --prompt "..."`. The binaries carry the licenses of their models.
+
+## Cookbook
+
+[`examples/cookbook/`](examples/cookbook/) holds small finished tools, each a few lines around one compiled binary: a classifier that answers with exactly one label (`--choices`), a natural-language-to-shell helper that stops at the first newline (`--stop`), a clipboard summarizer, a field extractor emitting one JSON object per line, a multi-turn chat whose turns are separate processes (`--save-kv` / `--load-kv`), and a Python batch labeller on the C library.
 
 ## Library mode (C API)
 

@@ -224,11 +224,13 @@ pub enum BufId {
     Bhb,
     Bhb2,
     BropeCs,
+    RopeCsLocal,
+    BropeCsLocal,
 }
-const N_BUFS: usize = 21;
+const N_BUFS: usize = 23;
 
 fn state_bufs(s: &State) -> [&Buf<f32>; N_BUFS] {
-    [&s.x, &s.xb, &s.xb2, &s.q, &s.k, &s.v, &s.hb, &s.hb2, &s.logits, &s.k_cache, &s.v_cache, &s.rope_cs, &s.bx, &s.bxb, &s.bxb2, &s.bq, &s.bk, &s.bv, &s.bhb, &s.bhb2, &s.brope_cs]
+    [&s.x, &s.xb, &s.xb2, &s.q, &s.k, &s.v, &s.hb, &s.hb2, &s.logits, &s.k_cache, &s.v_cache, &s.rope_cs, &s.bx, &s.bxb, &s.bxb2, &s.bq, &s.bk, &s.bv, &s.bhb, &s.bhb2, &s.brope_cs, &s.rope_cs_local, &s.brope_cs_local]
 }
 
 /// Index of a weight format in the pipeline tables (matches `KIND_NAMES`).
@@ -261,6 +263,7 @@ struct MmArgs {
     head_dim: u32,
     rot_dim: u32,
     bias: u32,
+    gelu: u32,
 }
 
 /// Fusions available on a matrix-vector product (decode step); see
@@ -280,6 +283,7 @@ struct NormArgs {
     n: u32,
     m: u32,
     eps: f32,
+    accumulate: u32,
 }
 #[repr(C)]
 struct RopeArgs {
@@ -303,10 +307,12 @@ struct AttnArgs {
     q_stride: u32,
     ctx: u32,
     scale: f32,
+    window: u32,
 }
 #[repr(C)]
 struct SiluArgs {
     n: u32,
+    gelu: u32,
 }
 
 /// A Metal device with the compiled kernels, the weights mapped without a
@@ -347,8 +353,8 @@ impl Gpu {
     pub fn new(weights: &'static [u8], state: &State, dims: &Dims) -> Result<Gpu, String> {
         let t0 = Instant::now();
         let mv_rows_override = std::env::var_os("AOT_GPU_MV_ROWS").and_then(|v| v.to_str()?.parse::<usize>().ok()).filter(|v| [1, 2, 4, 8].contains(v));
-        if !dims.head_dim.is_multiple_of(32) || dims.head_dim > 128 {
-            return Err(format!("the Metal attention kernel needs a head size that is a multiple of 32 and at most 128 (model has {})", dims.head_dim));
+        if !dims.head_dim.is_multiple_of(32) || dims.head_dim > 256 {
+            return Err(format!("the Metal attention kernel needs a head size that is a multiple of 32 and at most 256 (model has {})", dims.head_dim));
         }
         if !(weights.as_ptr() as usize).is_multiple_of(PAGE) {
             return Err("the weights are not page aligned; Metal cannot map them without copying".into());
@@ -522,8 +528,18 @@ impl Gpu {
     /// by the same thread), which is how the per-head q / k norms of Qwen3
     /// run: `n = head_dim`, `m = n_heads`.
     pub fn rmsnorm_at(&mut self, dst: BufId, dst_off: usize, src: BufId, src_off: usize, w: &Tensor, n: usize, m: usize, eps: f32) {
+        self.rmsnorm_impl(dst, dst_off, src, src_off, w, n, m, eps, false);
+    }
+
+    /// `dst[t] += src[t] / rms(src[t]) * w`: a normalised residual
+    /// connection (Gemma's post-attention / post-FFN norms).
+    pub fn rmsnorm_add(&mut self, dst: BufId, dst_off: usize, src: BufId, src_off: usize, w: &Tensor, n: usize, m: usize, eps: f32) {
+        self.rmsnorm_impl(dst, dst_off, src, src_off, w, n, m, eps, true);
+    }
+
+    fn rmsnorm_impl(&mut self, dst: BufId, dst_off: usize, src: BufId, src_off: usize, w: &Tensor, n: usize, m: usize, eps: f32, accumulate: bool) {
         debug_assert_eq!(w.kind, Kind::F32);
-        let args = NormArgs { n: n as u32, m: m as u32, eps };
+        let args = NormArgs { n: n as u32, m: m as u32, eps, accumulate: accumulate as u32 };
         unsafe {
             self.set_pipeline(self.pso_rmsnorm);
             self.set_buf(self.bufs[src as usize], src_off * 4, 0);
@@ -600,6 +616,7 @@ impl Gpu {
             head_dim,
             rot_dim,
             bias: opts.bias.is_some() as u32,
+            gelu: 0,
         };
         if let Some(b) = opts.bias {
             debug_assert!(b.kind == Kind::F32 && b.rows * b.cols >= w.rows, "bias must be f32 with one value per output row");
@@ -618,7 +635,7 @@ impl Gpu {
 
     /// Batched product (see [`Gpu::matmul`]), `m >= 2`.
     fn mm(&mut self, dst: BufId, dst_off: usize, w: &Tensor, src: BufId, src_off: usize, m: usize, accumulate: bool, bias: Option<&Tensor>) {
-        let args = MmArgs { rows: w.rows as u32, cols: w.cols as u32, m: m as u32, accumulate: accumulate as u32, x_stride: w.cols as u32, y_stride: w.rows as u32, rope: 0, head_dim: 1, rot_dim: 0, bias: bias.is_some() as u32 };
+        let args = MmArgs { rows: w.rows as u32, cols: w.cols as u32, m: m as u32, accumulate: accumulate as u32, x_stride: w.cols as u32, y_stride: w.rows as u32, rope: 0, head_dim: 1, rot_dim: 0, bias: bias.is_some() as u32, gelu: 0 };
         debug_assert!(w.cols.is_multiple_of(MM_TILE), "batched product needs a column count that is a multiple of 32");
         unsafe {
             self.set_pipeline(self.pso_mm[kind_idx(w.kind)]);
@@ -635,8 +652,14 @@ impl Gpu {
     /// and up projections plus the SwiGLU product in one dispatch. Both
     /// matrices must have the same format and shape.
     pub fn gate_up_silu(&mut self, dst: BufId, gate: &Tensor, up: &Tensor, src: BufId) {
+        self.gate_up(dst, gate, up, src, false);
+    }
+
+    /// [`Gpu::gate_up_silu`] with a choice of activation: `gelu` selects
+    /// GeGLU (Gemma), else SwiGLU.
+    pub fn gate_up(&mut self, dst: BufId, gate: &Tensor, up: &Tensor, src: BufId, gelu: bool) {
         debug_assert!(gate.kind == up.kind && gate.rows == up.rows && gate.cols == up.cols);
-        let args = MmArgs { rows: gate.rows as u32, cols: gate.cols as u32, m: 1, accumulate: 0, x_stride: gate.cols as u32, y_stride: gate.rows as u32, rope: 0, head_dim: 1, rot_dim: 0, bias: 0 };
+        let args = MmArgs { rows: gate.rows as u32, cols: gate.cols as u32, m: 1, accumulate: 0, x_stride: gate.cols as u32, y_stride: gate.rows as u32, rope: 0, head_dim: 1, rot_dim: 0, bias: 0, gelu: gelu as u32 };
         unsafe {
             self.set_pipeline(self.pso_gate[kind_idx(gate.kind)]);
             self.set_buf(self.wbuf, gate.off, 0);
@@ -672,7 +695,8 @@ impl Gpu {
 
     /// Causal attention of the `m` query rows in `q` (positions `pos0..`)
     /// over the KV cache of `layer`, written to `out` (rows of `q_dim`).
-    pub fn attention(&mut self, out: BufId, q: BufId, layer: usize, pos0: usize, m: usize, d: &Dims, ctx: usize) {
+    /// `window` > 0 restricts every query to the last `window` positions.
+    pub fn attention(&mut self, out: BufId, q: BufId, layer: usize, pos0: usize, m: usize, d: &Dims, ctx: usize, window: usize) {
         let base = layer * ctx * d.kv_dim();
         let args = AttnArgs {
             m: m as u32,
@@ -684,6 +708,7 @@ impl Gpu {
             q_stride: d.q_dim() as u32,
             ctx: ctx as u32,
             scale: 1.0 / (d.head_dim as f32).sqrt(),
+            window: window as u32,
         };
         unsafe {
             self.set_pipeline(self.pso_attention);
@@ -698,7 +723,12 @@ impl Gpu {
 
     /// `h[i] = silu(h[i]) * up[i]` for `n` elements.
     pub fn silu_mul(&mut self, h: BufId, up: BufId, n: usize) {
-        let args = SiluArgs { n: n as u32 };
+        self.act_mul(h, up, n, false);
+    }
+
+    /// `h[i] = act(h[i]) * up[i]` with `act` = GELU when `gelu`, else SiLU.
+    pub fn act_mul(&mut self, h: BufId, up: BufId, n: usize, gelu: bool) {
+        let args = SiluArgs { n: n as u32, gelu: gelu as u32 };
         unsafe {
             self.set_pipeline(self.pso_silu);
             self.set_buf(self.bufs[h as usize], 0, 0);

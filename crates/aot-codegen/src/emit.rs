@@ -168,6 +168,8 @@ fn emit_layer_batch(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec)
     let d = &spec.dims;
     let f = &spec.flags;
     let (dim, hidden, qd) = (d.dim, d.hidden, d.n_head * d.head_dim);
+    let cs = if l.local_attn { "s.brope_cs_local" } else { "s.brope_cs" };
+    let window = if l.local_attn { d.swa_window } else { 0 };
     writeln!(out, "/// Transformer block {i} over `m` consecutive prompt tokens starting at `pos0`.").unwrap();
     writeln!(out, "#[inline(never)]").unwrap();
     writeln!(out, "fn layer_{i}_batch(s: &mut State, w: &Weights, pool: &Pool, pos0: usize, m: usize) {{").unwrap();
@@ -187,13 +189,19 @@ fn emit_layer_batch(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec)
         writeln!(out, "    rmsnorm_heads_rows(&mut s.bk, w.f32s(&l.k_norm), m, {}, {}, DIMS.eps);", d.n_kv_head, d.head_dim).unwrap();
     }
     let rope_fn = if f.rope_neox { "rope_neox_rows" } else { "rope_rows" };
-    writeln!(out, "    {rope_fn}(&mut s.bq, m, {}, {}, {}, &s.brope_cs);", d.n_head, d.head_dim, d.rot_dim).unwrap();
-    writeln!(out, "    {rope_fn}(&mut s.bk, m, {}, {}, {}, &s.brope_cs);", d.n_kv_head, d.head_dim, d.rot_dim).unwrap();
+    writeln!(out, "    {rope_fn}(&mut s.bq, m, {}, {}, {}, &{cs});", d.n_head, d.head_dim, d.rot_dim).unwrap();
+    writeln!(out, "    {rope_fn}(&mut s.bk, m, {}, {}, {}, &{cs});", d.n_kv_head, d.head_dim, d.rot_dim).unwrap();
     writeln!(out, "    store_kv_rows(&mut s.k_cache, &mut s.v_cache, &s.bk, &s.bv, &DIMS, s.ctx, {i}, pos0, m);").unwrap();
-    writeln!(out, "    attention_rows(pool, &mut s.bxb, &s.bq, &s.k_cache, &s.v_cache, &mut s.scores, &DIMS, s.ctx, {i}, pos0, m);").unwrap();
+    writeln!(out, "    attention_rows(pool, &mut s.bxb, &s.bq, &s.k_cache, &s.v_cache, &mut s.scores, &DIMS, s.ctx, {i}, pos0, m, {window});").unwrap();
     emit_quantize_rows(out, "bxb", qd, [l.wo.kind].into_iter());
     emit_matmul(out, &l.wo, "l.wo", "bxb2", "bxb");
-    writeln!(out, "    add_inplace_par(pool, &mut s.bx[..m * {dim}], &s.bxb2[..m * {dim}]);").unwrap();
+    if f.post_norms {
+        // Gemma: the block output is normalised before it joins the residual stream.
+        writeln!(out, "    rmsnorm_rows_par(pool, &mut s.bxb, &s.bxb2, w.f32s(&l.attn_post_norm), DIMS.eps, m);").unwrap();
+        writeln!(out, "    add_inplace_par(pool, &mut s.bx[..m * {dim}], &s.bxb[..m * {dim}]);").unwrap();
+    } else {
+        writeln!(out, "    add_inplace_par(pool, &mut s.bx[..m * {dim}], &s.bxb2[..m * {dim}]);").unwrap();
+    }
     writeln!(out, "    rmsnorm_rows_par(pool, &mut s.bxb, &s.bx, w.f32s(&l.ffn_norm), DIMS.eps, m);").unwrap();
     emit_quantize_rows(out, "bxb", dim, [l.gate.kind, l.up.kind].into_iter());
     let fused = l.gate.kind == l.up.kind && l.gate.kind.activation() != Activation::F32;
@@ -215,10 +223,16 @@ fn emit_layer_batch(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec)
         emit_matmul(out, &l.gate, "l.gate", "bhb", "bxb");
         emit_matmul(out, &l.up, "l.up", "bhb2", "bxb");
     }
-    writeln!(out, "    silu_mul_par(pool, &mut s.bhb[..m * {hidden}], &s.bhb2[..m * {hidden}]);").unwrap();
+    let act = if f.gelu { "gelu_mul_par" } else { "silu_mul_par" };
+    writeln!(out, "    {act}(pool, &mut s.bhb[..m * {hidden}], &s.bhb2[..m * {hidden}]);").unwrap();
     emit_quantize_rows(out, "bhb", hidden, [l.down.kind].into_iter());
     emit_matmul(out, &l.down, "l.down", "bxb2", "bhb");
-    writeln!(out, "    add_inplace_par(pool, &mut s.bx[..m * {dim}], &s.bxb2[..m * {dim}]);").unwrap();
+    if f.post_norms {
+        writeln!(out, "    rmsnorm_rows_par(pool, &mut s.bxb, &s.bxb2, w.f32s(&l.ffn_post_norm), DIMS.eps, m);").unwrap();
+        writeln!(out, "    add_inplace_par(pool, &mut s.bx[..m * {dim}], &s.bxb[..m * {dim}]);").unwrap();
+    } else {
+        writeln!(out, "    add_inplace_par(pool, &mut s.bx[..m * {dim}], &s.bxb2[..m * {dim}]);").unwrap();
+    }
     writeln!(out, "}}\n").unwrap();
 }
 
@@ -230,7 +244,9 @@ fn emit_layer(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec) {
     let d = &spec.dims;
     let f = &spec.flags;
     let (dim, qd) = (d.dim, d.n_head * d.head_dim);
-    writeln!(out, "/// Transformer block {i}.").unwrap();
+    let cs = if l.local_attn { "s.rope_cs_local" } else { "s.rope_cs" };
+    let window = if l.local_attn { d.swa_window } else { 0 };
+    writeln!(out, "/// Transformer block {i}{}.", if l.local_attn { " (sliding-window attention)" } else { "" }).unwrap();
     writeln!(out, "#[inline(never)]").unwrap();
     writeln!(out, "fn layer_{i}(s: &mut State, w: &Weights, pool: &Pool, pos: usize) {{").unwrap();
     writeln!(out, "    let l = &LAYERS[{i}];").unwrap();
@@ -269,13 +285,18 @@ fn emit_layer(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec) {
         writeln!(out, "    rmsnorm_heads(&mut s.k, w.f32s(&l.k_norm), {}, {}, DIMS.eps);", d.n_kv_head, d.head_dim).unwrap();
     }
     let rope_fn = if f.rope_neox { "rope_neox" } else { "rope" };
-    writeln!(out, "    {rope_fn}(&mut s.q, {}, {}, {}, &s.rope_cs);", d.n_head, d.head_dim, d.rot_dim).unwrap();
-    writeln!(out, "    {rope_fn}(&mut s.k, {}, {}, {}, &s.rope_cs);", d.n_kv_head, d.head_dim, d.rot_dim).unwrap();
+    writeln!(out, "    {rope_fn}(&mut s.q, {}, {}, {}, &{cs});", d.n_head, d.head_dim, d.rot_dim).unwrap();
+    writeln!(out, "    {rope_fn}(&mut s.k, {}, {}, {}, &{cs});", d.n_kv_head, d.head_dim, d.rot_dim).unwrap();
     writeln!(out, "    store_kv(&mut s.k_cache, &mut s.v_cache, &s.k, &s.v, &DIMS, s.ctx, {i}, pos);").unwrap();
-    writeln!(out, "    attention(pool, &mut s.xb, &s.q, &s.k_cache, &s.v_cache, &mut s.scores, &DIMS, s.ctx, {i}, pos);").unwrap();
+    writeln!(out, "    attention(pool, &mut s.xb, &s.q, &s.k_cache, &s.v_cache, &mut s.scores, &DIMS, s.ctx, {i}, pos, {window});").unwrap();
     emit_quantize(out, "xb", qd, [l.wo.kind].into_iter());
     emit_matvec(out, &l.wo, "l.wo", "xb2", "xb");
-    writeln!(out, "    add_inplace(&mut s.x, &s.xb2[..{dim}]);").unwrap();
+    if f.post_norms {
+        writeln!(out, "    rmsnorm(&mut s.xb, &s.xb2[..{dim}], w.f32s(&l.attn_post_norm), DIMS.eps);").unwrap();
+        writeln!(out, "    add_inplace(&mut s.x, &s.xb[..{dim}]);").unwrap();
+    } else {
+        writeln!(out, "    add_inplace(&mut s.x, &s.xb2[..{dim}]);").unwrap();
+    }
     // Feed-forward.
     writeln!(out, "    rmsnorm(&mut s.xb, &s.x, w.f32s(&l.ffn_norm), DIMS.eps);").unwrap();
     emit_quantize(out, "xb", dim, [l.gate.kind, l.up.kind].into_iter());
@@ -299,10 +320,15 @@ fn emit_layer(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec) {
         emit_matvec(out, &l.gate, "l.gate", "hb", "xb");
         emit_matvec(out, &l.up, "l.up", "hb2", "xb");
     }
-    writeln!(out, "    silu_mul(&mut s.hb, &s.hb2);").unwrap();
+    writeln!(out, "    {}(&mut s.hb, &s.hb2);", if f.gelu { "gelu_mul" } else { "silu_mul" }).unwrap();
     emit_quantize(out, "hb", d.hidden, [l.down.kind].into_iter());
     emit_matvec(out, &l.down, "l.down", "xb2", "hb");
-    writeln!(out, "    add_inplace(&mut s.x, &s.xb2[..{dim}]);").unwrap();
+    if f.post_norms {
+        writeln!(out, "    rmsnorm(&mut s.xb, &s.xb2[..{dim}], w.f32s(&l.ffn_post_norm), DIMS.eps);").unwrap();
+        writeln!(out, "    add_inplace(&mut s.x, &s.xb[..{dim}]);").unwrap();
+    } else {
+        writeln!(out, "    add_inplace(&mut s.x, &s.xb2[..{dim}]);").unwrap();
+    }
     writeln!(out, "}}\n").unwrap();
 }
 
@@ -314,6 +340,9 @@ fn layer_fields(spec: &ModelSpec) -> Vec<&'static str> {
     }
     if spec.flags.qk_norm {
         v.extend(["q_norm", "k_norm"]);
+    }
+    if spec.flags.post_norms {
+        v.extend(["attn_post_norm", "ffn_post_norm"]);
     }
     v
 }
@@ -334,6 +363,8 @@ fn layer_tensor<'a>(l: &'a LayerSpec, field: &str) -> &'a TensorSpec {
         "bv" => l.bv.as_ref().expect("bias"),
         "q_norm" => l.q_norm.as_ref().expect("q_norm"),
         "k_norm" => l.k_norm.as_ref().expect("k_norm"),
+        "attn_post_norm" => l.attn_post_norm.as_ref().expect("attn_post_norm"),
+        "ffn_post_norm" => l.ffn_post_norm.as_ref().expect("ffn_post_norm"),
         _ => unreachable!(),
     }
 }
@@ -347,6 +378,7 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "//! Model: {} ({}, {})", spec.name, spec.arch, spec.file_type).unwrap();
     let attn = match (spec.flags.qkv_bias, spec.flags.qk_norm, spec.flags.rope_neox) {
         (true, _, true) => "attention(q/k/v + bias, NEOX RoPE)",
+        (_, true, true) if spec.flags.post_norms => "attention(per-head q/k RMSNorm, NEOX RoPE, sliding window) -> post-norm",
         (_, true, true) => "attention(per-head q/k RMSNorm, NEOX RoPE)",
         (_, _, true) => "attention(NEOX RoPE)",
         _ => "attention",
@@ -377,6 +409,9 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "    eps: {:?},", d.eps).unwrap();
     writeln!(o, "    rope_base: {:?},", d.rope_base).unwrap();
     writeln!(o, "    rope_scale: {:?},", d.rope_scale).unwrap();
+    writeln!(o, "    swa_window: {},", d.swa_window).unwrap();
+    writeln!(o, "    rope_base_local: {:?},", d.rope_base_local).unwrap();
+    writeln!(o, "    rope_scale_local: {:?},", d.rope_scale_local).unwrap();
     writeln!(o, "}};\n").unwrap();
 
     writeln!(o, "pub const INFO: ModelInfo = ModelInfo {{").unwrap();
@@ -432,7 +467,13 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "    assert!((token as usize) < DIMS.vocab, \"token id out of range\");").unwrap();
     writeln!(o, "    assert!(pos < s.ctx, \"position exceeds the context\");").unwrap();
     writeln!(o, "    dequant_row_{}(w.row(&TOKEN_EMBD, token as usize), &mut s.x);", spec.token_embd.kind.fn_suffix()).unwrap();
+    if spec.flags.embd_scale {
+        writeln!(o, "    scale_inplace(&mut s.x, {:?});", (d.dim as f32).sqrt()).unwrap();
+    }
     writeln!(o, "    rope_cos_sin(&mut s.rope_cs, &s.inv_freq, pos as f32 / DIMS.rope_scale);").unwrap();
+    if d.swa_window > 0 {
+        writeln!(o, "    rope_cos_sin(&mut s.rope_cs_local, &s.inv_freq_local, pos as f32 / DIMS.rope_scale_local);").unwrap();
+    }
     for i in 0..d.n_layer {
         writeln!(o, "    layer_{i}(s, w, pool, pos);").unwrap();
     }
@@ -455,7 +496,13 @@ pub fn emit_model_rs(spec: &ModelSpec, opts: &EmitOptions) -> String {
     writeln!(o, "        assert!((t as usize) < DIMS.vocab, \"token id out of range\");").unwrap();
     writeln!(o, "        dequant_row_{}(w.row(&TOKEN_EMBD, t as usize), &mut s.bx[i * {dim}..(i + 1) * {dim}]);", spec.token_embd.kind.fn_suffix(), dim = d.dim).unwrap();
     writeln!(o, "    }}").unwrap();
+    if spec.flags.embd_scale {
+        writeln!(o, "    scale_inplace(&mut s.bx[..m * {}], {:?});", d.dim, (d.dim as f32).sqrt()).unwrap();
+    }
     writeln!(o, "    rope_cos_sin_rows(&mut s.brope_cs, &s.inv_freq, pos0, m, DIMS.rope_scale);").unwrap();
+    if d.swa_window > 0 {
+        writeln!(o, "    rope_cos_sin_rows(&mut s.brope_cs_local, &s.inv_freq_local, pos0, m, DIMS.rope_scale_local);").unwrap();
+    }
     for i in 0..d.n_layer {
         writeln!(o, "    layer_{i}_batch(s, w, pool, pos0, m);").unwrap();
     }
@@ -485,13 +532,16 @@ fn emit_gpu_forwards(o: &mut String, spec: &ModelSpec) {
     let embd = spec.token_embd.kind.fn_suffix();
     // Decoding: 8 dispatches per block. RoPE is applied in the epilogue of
     // the q / k projections (k and v are written straight into the cache),
-    // the gate / up projections and the SwiGLU product are one kernel when
+    // the gate / up projections and the gated product are one kernel when
     // both matrices share a format, and the residual adds are folded into
     // the wo / down products. RMSNorm stays a separate (12 us) dispatch:
-    // folding it into the products was measured 2-3x slower.
+    // folding it into the products was measured 2-3x slower. Models with
+    // NEOX RoPE rotate in a separate dispatch (the pairs are half a head
+    // apart); Gemma's post-norms accumulate into the residual stream.
     let f = &spec.flags;
     let (bq, bk, bv) = if f.qkv_bias { ("Some(&l.bq)", "Some(&l.bk)", "Some(&l.bv)") } else { ("None", "None", "None") };
-    // Per-head q / k RMSNorm (Qwen3), in place, before RoPE.
+    let gelu = f.gelu;
+    // Per-head q / k RMSNorm (Qwen3, Gemma 3), in place, before RoPE.
     let qk_norm = |m: &str| -> String {
         if f.qk_norm {
             format!(
@@ -507,84 +557,123 @@ fn emit_gpu_forwards(o: &mut String, spec: &ModelSpec) {
         }
     };
     let decode_block = |l: &LayerSpec| -> String {
+        let (cs, window) = if l.local_attn { ("RopeCsLocal", d.swa_window) } else { ("RopeCs", 0) };
         let gate = if l.gate.kind == l.up.kind && l.gate.rows == l.up.rows {
-            "        g.gate_up_silu(BufId::Hb, &l.gate, &l.up, BufId::Xb);\n".to_string()
+            format!("        g.gate_up(BufId::Hb, &l.gate, &l.up, BufId::Xb, {gelu});\n")
         } else {
             format!(
                 "        g.matmul(BufId::Hb, 0, &l.gate, BufId::Xb, 0, 1, false);
         g.matmul(BufId::Hb2, 0, &l.up, BufId::Xb, 0, 1, false);
-        g.silu_mul(BufId::Hb, BufId::Hb2, {hidden});\n"
+        g.act_mul(BufId::Hb, BufId::Hb2, {hidden}, {gelu});\n"
             )
         };
-        // Llama: RoPE fused into the q / k products (adjacent pairs). NEOX
-        // pairs are half a head apart, so Qwen models rotate in a separate
-        // dispatch after the optional bias / per-head norm.
         let qkv = if f.rope_neox {
             format!(
                 "        g.mv(BufId::Q, 0, &l.wq, BufId::Xb, 0, None, MvOpts {{ bias: {bq}, ..MvOpts::default() }});
         g.mv(BufId::KCache, kv_at, &l.wk, BufId::Xb, 0, None, MvOpts {{ bias: {bk}, ..MvOpts::default() }});
         g.mv(BufId::VCache, kv_at, &l.wv, BufId::Xb, 0, None, MvOpts {{ bias: {bv}, ..MvOpts::default() }});
-{norm}        g.rope_ex(BufId::Q, BufId::KCache, kv_at, 1, BufId::RopeCs, &DIMS, true);\n",
+{norm}        g.rope_ex(BufId::Q, BufId::KCache, kv_at, 1, BufId::{cs}, &DIMS, true);\n",
                 norm = qk_norm("1")
             )
         } else {
             format!(
-                "        g.mv(BufId::Q, 0, &l.wq, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::RopeCs), bias: {bq}, ..MvOpts::default() }});
-        g.mv(BufId::KCache, kv_at, &l.wk, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::RopeCs), bias: {bk}, ..MvOpts::default() }});
+                "        g.mv(BufId::Q, 0, &l.wq, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::{cs}), bias: {bq}, ..MvOpts::default() }});
+        g.mv(BufId::KCache, kv_at, &l.wk, BufId::Xb, 0, Some(&DIMS), MvOpts {{ rope: Some(BufId::{cs}), bias: {bk}, ..MvOpts::default() }});
         g.mv(BufId::VCache, kv_at, &l.wv, BufId::Xb, 0, None, MvOpts {{ bias: {bv}, ..MvOpts::default() }});\n"
+            )
+        };
+        // Residual joins: fused into the products, or normalised first (Gemma).
+        let (wo, down) = if f.post_norms {
+            (
+                format!(
+                    "        g.mv(BufId::Xb2, 0, &l.wo, BufId::Xb, 0, None, MvOpts::default());
+        g.rmsnorm_add(BufId::X, 0, BufId::Xb2, 0, &l.attn_post_norm, {dim}, 1, DIMS.eps);\n"
+                ),
+                format!(
+                    "        g.mv(BufId::Xb2, 0, &l.down, BufId::Hb, 0, None, MvOpts::default());
+        g.rmsnorm_add(BufId::X, 0, BufId::Xb2, 0, &l.ffn_post_norm, {dim}, 1, DIMS.eps);\n"
+                ),
+            )
+        } else {
+            (
+                "        g.mv(BufId::X, 0, &l.wo, BufId::Xb, 0, None, MvOpts { accumulate: true, ..MvOpts::default() });\n".to_string(),
+                "        g.mv(BufId::X, 0, &l.down, BufId::Hb, 0, None, MvOpts { accumulate: true, ..MvOpts::default() });\n".to_string(),
             )
         };
         format!(
             "        let kv_at = (i * s.ctx + pos) * kv;
         g.rmsnorm(BufId::Xb, BufId::X, 0, &l.attn_norm, {dim}, 1, DIMS.eps);
-{qkv}        g.attention(BufId::Xb, BufId::Q, i, pos, 1, &DIMS, s.ctx);
-        g.mv(BufId::X, 0, &l.wo, BufId::Xb, 0, None, MvOpts {{ accumulate: true, ..MvOpts::default() }});
-        g.rmsnorm(BufId::Xb, BufId::X, 0, &l.ffn_norm, {dim}, 1, DIMS.eps);
-{gate}        g.mv(BufId::X, 0, &l.down, BufId::Hb, 0, None, MvOpts {{ accumulate: true, ..MvOpts::default() }});
-"
+{qkv}        g.attention(BufId::Xb, BufId::Q, i, pos, 1, &DIMS, s.ctx, {window});
+{wo}        g.rmsnorm(BufId::Xb, BufId::X, 0, &l.ffn_norm, {dim}, 1, DIMS.eps);
+{gate}{down}"
         )
     };
-    // Every layer has the same tensor layout, so the block body is identical
-    // unless a layer mixes gate / up formats; emit per-layer code only then.
-    let uniform = spec.layers.iter().all(|l| (l.gate.kind == l.up.kind && l.gate.rows == l.up.rows) == (spec.layers[0].gate.kind == spec.layers[0].up.kind && spec.layers[0].gate.rows == spec.layers[0].up.rows));
-    let decode_body = if uniform {
-        format!("    for (i, l) in LAYERS.iter().enumerate() {{\n{}    }}\n", decode_block(&spec.layers[0]))
-    } else {
-        let mut b = String::new();
-        for (i, l) in spec.layers.iter().enumerate() {
-            b.push_str(&format!("    {{\n        let (i, l) = ({i}, &LAYERS[{i}]);\n{}    }}\n", decode_block(l)));
-        }
-        b
-    };
-    // Prompt batches: the plain sequence (12 dispatches per block); the
-    // batched kernels are compute bound, so fusion matters less there.
-    let batch_body = format!(
-        "    for (i, l) in LAYERS.iter().enumerate() {{
-        let kv_at = (i * s.ctx + pos0) * kv;
+    // Prompt batches: the plain sequence; the batched kernels are compute
+    // bound, so fusion matters less there.
+    let batch_block = |l: &LayerSpec| -> String {
+        let (cs, window) = if l.local_attn { ("BropeCsLocal", d.swa_window) } else { ("BropeCs", 0) };
+        let (wo, down) = if f.post_norms {
+            (
+                format!(
+                    "        g.matmul(BufId::Bxb2, 0, &l.wo, BufId::Bxb, 0, m, false);
+        g.rmsnorm_add(BufId::Bx, 0, BufId::Bxb2, 0, &l.attn_post_norm, {dim}, m, DIMS.eps);\n"
+                ),
+                format!(
+                    "        g.matmul(BufId::Bxb2, 0, &l.down, BufId::Bhb, 0, m, false);
+        g.rmsnorm_add(BufId::Bx, 0, BufId::Bxb2, 0, &l.ffn_post_norm, {dim}, m, DIMS.eps);\n"
+                ),
+            )
+        } else {
+            ("        g.matmul(BufId::Bx, 0, &l.wo, BufId::Bxb, 0, m, true);\n".to_string(), "        g.matmul(BufId::Bx, 0, &l.down, BufId::Bhb, 0, m, true);\n".to_string())
+        };
+        format!(
+            "        let kv_at = (i * s.ctx + pos0) * kv;
         g.rmsnorm(BufId::Bxb, BufId::Bx, 0, &l.attn_norm, {dim}, m, DIMS.eps);
         g.matmul_bias(BufId::Bq, 0, &l.wq, BufId::Bxb, 0, m, false, {bq});
         g.matmul_bias(BufId::KCache, kv_at, &l.wk, BufId::Bxb, 0, m, false, {bk});
         g.matmul_bias(BufId::VCache, kv_at, &l.wv, BufId::Bxb, 0, m, false, {bv});
-{norm}        g.rope_ex(BufId::Bq, BufId::KCache, kv_at, m, BufId::BropeCs, &DIMS, {neox});
-        g.attention(BufId::Bxb, BufId::Bq, i, pos0, m, &DIMS, s.ctx);
-        g.matmul(BufId::Bx, 0, &l.wo, BufId::Bxb, 0, m, true);
-        g.rmsnorm(BufId::Bxb, BufId::Bx, 0, &l.ffn_norm, {dim}, m, DIMS.eps);
+{norm}        g.rope_ex(BufId::Bq, BufId::KCache, kv_at, m, BufId::{cs}, &DIMS, {neox});
+        g.attention(BufId::Bxb, BufId::Bq, i, pos0, m, &DIMS, s.ctx, {window});
+{wo}        g.rmsnorm(BufId::Bxb, BufId::Bx, 0, &l.ffn_norm, {dim}, m, DIMS.eps);
         g.matmul(BufId::Bhb, 0, &l.gate, BufId::Bxb, 0, m, false);
         g.matmul(BufId::Bhb2, 0, &l.up, BufId::Bxb, 0, m, false);
-        g.silu_mul(BufId::Bhb, BufId::Bhb2, m * {hidden});
-        g.matmul(BufId::Bx, 0, &l.down, BufId::Bhb, 0, m, true);
-    }}
-",
-        norm = qk_norm("m"),
-        neox = f.rope_neox,
-    );
+        g.act_mul(BufId::Bhb, BufId::Bhb2, m * {hidden}, {gelu});
+{down}",
+            norm = qk_norm("m"),
+            neox = f.rope_neox,
+        )
+    };
+    // Every layer has the same tensor layout, so one loop body serves all
+    // of them unless layers differ (gate / up format mix, local vs global
+    // attention); then the blocks are emitted per layer.
+    let shape = |l: &LayerSpec| ((l.gate.kind == l.up.kind && l.gate.rows == l.up.rows), l.local_attn);
+    let uniform = spec.layers.iter().all(|l| shape(l) == shape(&spec.layers[0]));
+    let body = |block: &dyn Fn(&LayerSpec) -> String| -> String {
+        if uniform {
+            format!("    for (i, l) in LAYERS.iter().enumerate() {{\n{}    }}\n", block(&spec.layers[0]))
+        } else {
+            let mut b = String::new();
+            for (i, l) in spec.layers.iter().enumerate() {
+                b.push_str(&format!("    {{\n        let (i, l) = ({i}, &LAYERS[{i}]);\n{}    }}\n", block(l)));
+            }
+            b
+        }
+    };
+    let decode_body = body(&decode_block);
+    let batch_body = body(&batch_block);
+    let scale = if f.embd_scale { format!("    scale_inplace(&mut s.x, {:?});\n", (d.dim as f32).sqrt()) } else { String::new() };
+    let scale_rows = if f.embd_scale { format!("    scale_inplace(&mut s.bx[..m * {dim}], {:?});\n", (d.dim as f32).sqrt()) } else { String::new() };
+    let local = if d.swa_window > 0 { "    rope_cos_sin(&mut s.rope_cs_local, &s.inv_freq_local, pos as f32 / DIMS.rope_scale_local);\n" } else { "" };
+    let local_rows = if d.swa_window > 0 { "    rope_cos_sin_rows(&mut s.brope_cs_local, &s.inv_freq_local, pos0, m, DIMS.rope_scale_local);\n" } else { "" };
     writeln!(o, "\n/// [`forward`] on the GPU: one command buffer for the whole step.").unwrap();
     writeln!(o, "#[cfg(target_os = \"macos\")]").unwrap();
     writeln!(o, "pub fn forward_gpu(s: &mut State, w: &Weights, g: &mut Gpu, token: u32, pos: usize, want_logits: bool) {{").unwrap();
     writeln!(o, "    assert!((token as usize) < DIMS.vocab, \"token id out of range\");").unwrap();
     writeln!(o, "    assert!(pos < s.ctx, \"position exceeds the context\");").unwrap();
     writeln!(o, "    dequant_row_{embd}(w.row(&TOKEN_EMBD, token as usize), &mut s.x);").unwrap();
+    o.push_str(&scale);
     writeln!(o, "    rope_cos_sin(&mut s.rope_cs, &s.inv_freq, pos as f32 / DIMS.rope_scale);").unwrap();
+    o.push_str(local);
     writeln!(o, "    let kv = DIMS.kv_dim();").unwrap();
     writeln!(o, "    g.begin();").unwrap();
     o.push_str(&decode_body);
@@ -605,7 +694,9 @@ fn emit_gpu_forwards(o: &mut String, spec: &ModelSpec) {
     writeln!(o, "        assert!((t as usize) < DIMS.vocab, \"token id out of range\");").unwrap();
     writeln!(o, "        dequant_row_{embd}(w.row(&TOKEN_EMBD, t as usize), &mut s.bx[i * {dim}..(i + 1) * {dim}]);").unwrap();
     writeln!(o, "    }}").unwrap();
+    o.push_str(&scale_rows);
     writeln!(o, "    rope_cos_sin_rows(&mut s.brope_cs, &s.inv_freq, pos0, m, DIMS.rope_scale);").unwrap();
+    o.push_str(local_rows);
     writeln!(o, "    let kv = DIMS.kv_dim();").unwrap();
     writeln!(o, "    g.begin();").unwrap();
     o.push_str(&batch_body);

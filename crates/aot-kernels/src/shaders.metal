@@ -20,11 +20,15 @@ struct MmArgs {
     uint head_dim;    // for rope: output row r is dimension r % head_dim of its head
     uint rot_dim;     // for rope: dimensions >= rot_dim are left alone
     uint bias;        // 1: add bias[row] to every output row (projection biases)
+    uint gelu;        // gate kernel: 1 = gelu(gate) * up (Gemma), 0 = silu(gate) * up
 };
-struct NormArgs { uint n; uint m; float eps; };
+struct NormArgs { uint n; uint m; float eps; uint accumulate; };
 struct RopeArgs { uint m; uint n_head; uint n_kv_head; uint head_dim; uint rot_dim; uint q_stride; uint k_stride; uint neox; };
-struct AttnArgs { uint m; uint pos0; uint n_head; uint gqa; uint head_dim; uint kv_dim; uint q_stride; uint ctx; float scale; };
-struct SiluArgs { uint n; };
+struct AttnArgs { uint m; uint pos0; uint n_head; uint gqa; uint head_dim; uint kv_dim; uint q_stride; uint ctx; float scale; uint window; };
+struct SiluArgs { uint n; uint gelu; };
+
+/// GELU, tanh approximation (ggml's `gelu`).
+static inline float gelu_f(float v) { return 0.5f * v * (1.0f + tanh(0.7978845608028654f * (v + 0.044715f * v * v * v))); }
 
 static inline float f16f(ushort u) { return float(as_type<half>(u)); }
 static inline ushort u16at(device const uchar* p) { return (ushort)p[0] | ((ushort)p[1] << 8); }
@@ -673,7 +677,7 @@ kernel void kernel_mv_gate(
     }
     const float g = simd_sum(sg);
     const float u = simd_sum(su);
-    if (tiisg == 0) y[row] = g / (1.0f + exp(-g)) * u;
+    if (tiisg == 0) y[row] = (a.gelu ? gelu_f(g) : g / (1.0f + exp(-g))) * u;
 }
 
 typedef decltype(kernel_mv<Q4K, 4>) mv_t;
@@ -726,7 +730,10 @@ kernel void kernel_rmsnorm(
     float tot = 0.0f;
     for (uint i = 0; i < 8; i++) tot += part[i];
     const float r = 1.0f / sqrt(tot / float(a.n) + a.eps);
-    for (uint i = tid; i < a.n; i += 256) yr[i] = xr[i] * r * w[i];
+    for (uint i = tid; i < a.n; i += 256) {
+        const float v = xr[i] * r * w[i];
+        yr[i] = a.accumulate ? (yr[i] + v) : v;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -777,8 +784,8 @@ kernel void kernel_attention(
     uint tiisg [[thread_index_in_simdgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float tq[128];
-    threadgroup float tacc[4 * 128];
+    threadgroup float tq[256];
+    threadgroup float tacc[4 * 256];
     threadgroup float tM[4];
     threadgroup float tL[4];
     const uint t = tgpig.x;
@@ -787,18 +794,20 @@ kernel void kernel_attention(
     const uint dpl = hd / 32;
     const uint kvh = h / a.gqa;
     const uint n = a.pos0 + t + 1;
+    // Sliding-window layers see only the last `window` positions.
+    const uint start = (a.window != 0 && n > a.window) ? n - a.window : 0;
     device const float* qh = q + t * a.q_stride + h * hd;
-    if (tid < hd) tq[tid] = qh[tid] * a.scale;
+    for (uint i = tid; i < hd; i += 128) tq[i] = qh[i] * a.scale;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float M = -INFINITY;
     float L = 0.0f;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const uint nblocks = (n + 31) / 32;
-    for (uint b = sgitg; b < nblocks; b += 4) {
+    for (uint b = start / 32 + sgitg; b < nblocks; b += 4) {
         const uint p = b * 32 + tiisg;
         float s = -INFINITY;
-        if (p < n) {
+        if (p < n && p >= start) {
             device const float* kr = kc + p * a.kv_dim + kvh * hd;
             float d = 0.0f;
             for (uint i = 0; i < hd; i += 4) {
@@ -808,7 +817,7 @@ kernel void kernel_attention(
             s = d;
         }
         const float Mn = max(M, simd_max(s));
-        const float pe = (p < n) ? exp(s - Mn) : 0.0f;
+        const float pe = (p < n && p >= start) ? exp(s - Mn) : 0.0f;
         const float alpha = exp(M - Mn);
         L = L * alpha + simd_sum(pe);
         for (uint i = 0; i < dpl; i++) acc[i] *= alpha;
@@ -825,17 +834,19 @@ kernel void kernel_attention(
         tM[sgitg] = M;
         tL[sgitg] = L;
     }
-    for (uint i = 0; i < dpl; i++) tacc[sgitg * 128 + tiisg * dpl + i] = acc[i];
+    for (uint i = 0; i < dpl; i++) tacc[sgitg * 256 + tiisg * dpl + i] = acc[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < hd) {
-        const float Mg = max(max(tM[0], tM[1]), max(tM[2], tM[3]));
-        float Lg = 0.0f, o = 0.0f;
-        for (uint g = 0; g < 4; g++) {
-            const float sc = (tM[g] == -INFINITY) ? 0.0f : exp(tM[g] - Mg);
-            Lg += tL[g] * sc;
-            o += tacc[g * 128 + tid] * sc;
-        }
-        out[t * a.q_stride + h * hd + tid] = o / Lg;
+    const float Mg = max(max(tM[0], tM[1]), max(tM[2], tM[3]));
+    float sc[4];
+    float Lg = 0.0f;
+    for (uint g = 0; g < 4; g++) {
+        sc[g] = (tM[g] == -INFINITY) ? 0.0f : exp(tM[g] - Mg);
+        Lg += tL[g] * sc[g];
+    }
+    for (uint i = tid; i < hd; i += 128) {
+        float o = 0.0f;
+        for (uint g = 0; g < 4; g++) o += tacc[g * 256 + i] * sc[g];
+        out[t * a.q_stride + h * hd + i] = o / Lg;
     }
 }
 
@@ -850,5 +861,5 @@ kernel void kernel_silu_mul(
 {
     if (gid >= a.n) return;
     const float v = h[gid];
-    h[gid] = v / (1.0f + exp(-v)) * u[gid];
+    h[gid] = (a.gelu ? gelu_f(v) : v / (1.0f + exp(-v))) * u[gid];
 }

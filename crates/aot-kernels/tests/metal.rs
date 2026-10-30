@@ -31,7 +31,23 @@ impl Rng {
 }
 
 fn dims(head_dim: usize) -> Dims {
-    Dims { dim: 2560, hidden: 2560, n_layer: 2, n_head: 4, n_kv_head: 2, head_dim, rot_dim: head_dim, vocab: 2560, n_ctx_train: 64, eps: 1e-5, rope_base: 10000.0, rope_scale: 1.0 }
+    Dims {
+        dim: 2560,
+        hidden: 2560,
+        n_layer: 2,
+        n_head: 4,
+        n_kv_head: 2,
+        head_dim,
+        rot_dim: head_dim,
+        vocab: 2560,
+        n_ctx_train: 64,
+        eps: 1e-5,
+        rope_base: 10000.0,
+        rope_scale: 1.0,
+        swa_window: 0,
+        rope_base_local: 10000.0,
+        rope_scale_local: 1.0,
+    }
 }
 
 /// Leak a page-aligned copy of `bytes` as the weights blob.
@@ -189,7 +205,23 @@ fn rmsnorm_rope_silu_match_cpu_ops() {
 #[test]
 fn fused_decode_kernels_match_separate_ops() {
     let mut rng = Rng(0xF00D);
-    let d = Dims { dim: 512, hidden: 1024, n_layer: 1, n_head: 4, n_kv_head: 2, head_dim: 64, rot_dim: 64, vocab: 16, n_ctx_train: 64, eps: 1e-5, rope_base: 10000.0, rope_scale: 1.0 };
+    let d = Dims {
+        dim: 512,
+        hidden: 1024,
+        n_layer: 1,
+        n_head: 4,
+        n_kv_head: 2,
+        head_dim: 64,
+        rot_dim: 64,
+        vocab: 16,
+        n_ctx_train: 64,
+        eps: 1e-5,
+        rope_base: 10000.0,
+        rope_scale: 1.0,
+        swa_window: 0,
+        rope_base_local: 10000.0,
+        rope_scale_local: 1.0,
+    };
     for kind in [Kind::Q4_K, Kind::Q6_K, Kind::Q4_0, Kind::Q5_0, Kind::F16] {
         let mut blob = Vec::new();
         let mut mk = |rng: &mut Rng, rows: usize, cols: usize| -> Tensor {
@@ -246,9 +278,79 @@ fn fused_decode_kernels_match_separate_ops() {
     }
 }
 
+/// Sliding-window attention, GeGLU and the accumulating RMSNorm (Gemma 3).
+#[test]
+fn window_gelu_and_norm_add_match_cpu() {
+    let mut rng = Rng(0x5A5A);
+    let d = dims(64);
+    let ctx = 96;
+    let mut state = State::new(&d, ctx, None, 2, 16);
+    let n = d.dim;
+    let mut wv = vec![0f32; n];
+    rng.fill(&mut wv, 1.0);
+    let mut blob: Vec<u8> = wv.iter().flat_map(|v| v.to_le_bytes()).collect();
+    while !blob.len().is_multiple_of(32) {
+        blob.push(0);
+    }
+    let w = weights_blob(&blob);
+    let norm_w = Tensor { name: "norm", kind: Kind::F32, off: 0, len: n * 4, rows: 1, cols: n };
+    let Some(mut gpu) = gpu_or_skip(w, &state, &d) else { return };
+    let kv = d.kv_dim();
+    let qd = d.q_dim();
+    rng.fill(&mut state.k_cache[..ctx * kv], 1.0);
+    rng.fill(&mut state.v_cache[..ctx * kv], 1.0);
+    let pool = Pool::new(2);
+    let mut scratch = vec![0f32; 4 * ctx];
+    for (pos, window) in [(70usize, 16usize), (10, 16), (70, 1), (70, 0), (3, 4)] {
+        rng.fill(&mut state.q[..qd], 1.0);
+        let mut want = vec![0f32; qd];
+        ops::attention(&pool, &mut want, &state.q, &state.k_cache, &state.v_cache, &mut scratch, &d, ctx, 0, pos, window);
+        gpu.begin();
+        gpu.attention(BufId::Xb, BufId::Q, 0, pos, 1, &d, ctx, window);
+        gpu.finish();
+        let (err, scale) = max_err(&state.xb[..qd], &want.iter().map(|&v| v as f64).collect::<Vec<_>>());
+        eprintln!("attention pos {pos} window {window}: err {err:.2e}");
+        assert!(err <= 1e-4 * scale + 1e-5, "pos {pos} window {window}: err {err}");
+    }
+    // Batched rows with a window.
+    let m = 5;
+    rng.fill(&mut state.bq[..m * qd], 1.0);
+    let mut want = vec![0f32; m * qd];
+    ops::attention_rows(&pool, &mut want, &state.bq[..m * qd], &state.k_cache, &state.v_cache, &mut scratch, &d, ctx, 0, 40, m, 8);
+    gpu.begin();
+    gpu.attention(BufId::Bxb, BufId::Bq, 0, 40, m, &d, ctx, 8);
+    gpu.finish();
+    let (err, scale) = max_err(&state.bxb[..m * qd], &want.iter().map(|&v| v as f64).collect::<Vec<_>>());
+    assert!(err <= 1e-4 * scale + 1e-5, "batched window: err {err}");
+
+    // GeGLU.
+    let nh = 1000;
+    rng.fill(&mut state.bhb[..nh], 3.0);
+    rng.fill(&mut state.bhb2[..nh], 3.0);
+    let mut h_ref = state.bhb[..nh].to_vec();
+    ops::gelu_mul(&mut h_ref, &state.bhb2[..nh]);
+    gpu.begin();
+    gpu.act_mul(BufId::Bhb, BufId::Bhb2, nh, true);
+    gpu.finish();
+    let (eg, sg) = max_err(&state.bhb[..nh], &h_ref.iter().map(|&v| v as f64).collect::<Vec<_>>());
+    assert!(eg <= 1e-5 * sg + 1e-6, "gelu_mul: err {eg}");
+
+    // dst += rmsnorm(src) over m rows.
+    rng.fill(&mut state.bx[..m * n], 2.0);
+    rng.fill(&mut state.bxb2[..m * n], 3.0);
+    let mut normed = vec![0f32; m * n];
+    ops::rmsnorm_rows(&mut normed, &state.bxb2[..m * n], &wv, d.eps, m);
+    let want: Vec<f64> = state.bx[..m * n].iter().zip(&normed).map(|(a, b)| (*a + *b) as f64).collect();
+    gpu.begin();
+    gpu.rmsnorm_add(BufId::Bx, 0, BufId::Bxb2, 0, &norm_w, n, m, d.eps);
+    gpu.finish();
+    let (en, sn) = max_err(&state.bx[..m * n], &want);
+    assert!(en <= 1e-5 * sn + 1e-6, "rmsnorm_add: err {en}");
+}
+
 #[test]
 fn attention_matches_cpu_for_both_head_sizes() {
-    for head_dim in [64usize, 128] {
+    for head_dim in [64usize, 128, 256] {
         let mut rng = Rng(0xA77 + head_dim as u64);
         let d = Dims { n_head: 4, n_kv_head: 2, head_dim, rot_dim: head_dim, ..dims(head_dim) };
         let ctx = 100;
@@ -268,9 +370,9 @@ fn attention_matches_cpu_for_both_head_sizes() {
             rng.fill(&mut state.bq[..m * qd], 3.0);
             let mut want = vec![0f32; m * qd];
             let mut scratch = vec![0f32; 2 * ctx];
-            ops::attention_rows(&pool, &mut want, &state.bq[..m * qd], &state.k_cache, &state.v_cache, &mut scratch, &d, ctx, layer, pos0, m);
+            ops::attention_rows(&pool, &mut want, &state.bq[..m * qd], &state.k_cache, &state.v_cache, &mut scratch, &d, ctx, layer, pos0, m, 0);
             gpu.begin();
-            gpu.attention(BufId::Bxb, BufId::Bq, layer, pos0, m, &d, ctx);
+            gpu.attention(BufId::Bxb, BufId::Bq, layer, pos0, m, &d, ctx, 0);
             gpu.finish();
             let (err, scale) = max_err(&state.bxb[..m * qd], &want.iter().map(|&v| v as f64).collect::<Vec<_>>());
             eprintln!("attention hd={head_dim} pos0={pos0} m={m}: err {err:.2e} (max {scale:.2})");
@@ -286,7 +388,23 @@ fn attention_matches_cpu_for_both_head_sizes() {
 #[ignore]
 fn bench_ops() {
     use std::time::Instant;
-    let d = Dims { dim: 2048, hidden: 5632, n_layer: 22, n_head: 32, n_kv_head: 4, head_dim: 64, rot_dim: 64, vocab: 32000, n_ctx_train: 2048, eps: 1e-5, rope_base: 10000.0, rope_scale: 1.0 };
+    let d = Dims {
+        dim: 2048,
+        hidden: 5632,
+        n_layer: 22,
+        n_head: 32,
+        n_kv_head: 4,
+        head_dim: 64,
+        rot_dim: 64,
+        vocab: 32000,
+        n_ctx_train: 2048,
+        eps: 1e-5,
+        rope_base: 10000.0,
+        rope_scale: 1.0,
+        swa_window: 0,
+        rope_base_local: 10000.0,
+        rope_scale_local: 1.0,
+    };
     let ctx = 256;
     let mut rng = Rng(0x5EED);
     // Layout per layer: wq, wk (Q4_K), wv (Q6_K), wo, gate, up (Q4_K), down (Q6_K); plus the Q6_K output head.
@@ -378,9 +496,9 @@ fn bench_ops() {
     time(&mut gpu, "rope", 50, 0, &|g| g.rope(BufId::Q, BufId::KCache, 0, 1, BufId::RopeCs, &d));
     time(&mut gpu, "silu_mul 5632", 50, 0, &|g| g.silu_mul(BufId::Hb, BufId::Hb2, d.hidden));
     for p in [10usize, 100, 250] {
-        time(&mut gpu, &format!("attention pos={p}"), 50, 0, &|g| g.attention(BufId::Xb, BufId::Q, 0, p, 1, &d, ctx));
+        time(&mut gpu, &format!("attention pos={p}"), 50, 0, &|g| g.attention(BufId::Xb, BufId::Q, 0, p, 1, &d, ctx, 0));
     }
-    time(&mut gpu, "attention m=64 pos0=100", 10, 0, &|g| g.attention(BufId::Bxb, BufId::Bq, 0, 100, 64, &d, ctx));
+    time(&mut gpu, "attention m=64 pos0=100", 10, 0, &|g| g.attention(BufId::Bxb, BufId::Bq, 0, 100, 64, &d, ctx, 0));
 
     // A whole decode step with the real operator sequence, and ablations.
     let token = |g: &mut Gpu, matmuls: bool, small: bool, attn: bool| {
@@ -399,7 +517,7 @@ fn bench_ops() {
                 g.rope(BufId::Q, BufId::KCache, kv_at, 1, BufId::RopeCs, &d);
             }
             if attn {
-                g.attention(BufId::Xb, BufId::Q, i, pos, 1, &d, ctx);
+                g.attention(BufId::Xb, BufId::Q, i, pos, 1, &d, ctx, 0);
             }
             if matmuls {
                 g.matmul(BufId::X, 0, &l[3], BufId::Xb, 0, 1, true);
@@ -438,7 +556,7 @@ fn bench_ops() {
             g.mv(BufId::Q, 0, &l[0], BufId::Xb, 0, Some(&d), MvOpts { rope: Some(BufId::RopeCs), ..MvOpts::default() });
             g.mv(BufId::KCache, kv_at, &l[1], BufId::Xb, 0, Some(&d), MvOpts { rope: Some(BufId::RopeCs), ..MvOpts::default() });
             g.mv(BufId::VCache, kv_at, &l[2], BufId::Xb, 0, None, MvOpts::default());
-            g.attention(BufId::Xb, BufId::Q, i, pos, 1, &d, ctx);
+            g.attention(BufId::Xb, BufId::Q, i, pos, 1, &d, ctx, 0);
             g.mv(BufId::X, 0, &l[3], BufId::Xb, 0, None, MvOpts { accumulate: true, ..MvOpts::default() });
             g.rmsnorm(BufId::Xb, BufId::X, 0, &norm, d.dim, 1, d.eps);
             g.gate_up_silu(BufId::Hb, &l[4], &l[5], BufId::Xb);

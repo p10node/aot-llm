@@ -119,6 +119,27 @@ pub fn silu_mul(h: &mut [f32], up: &[f32]) {
     }
 }
 
+/// GELU, tanh approximation (what ggml calls `gelu`; Gemma's activation).
+#[inline]
+pub fn gelu(v: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = std::f32::consts::FRAC_2_SQRT_PI / std::f32::consts::SQRT_2;
+    0.5 * v * (1.0 + (SQRT_2_OVER_PI * (v + 0.044715 * v * v * v)).tanh())
+}
+
+/// `h = gelu(h) * up` (GeGLU gating, Gemma).
+pub fn gelu_mul(h: &mut [f32], up: &[f32]) {
+    for (a, &b) in h.iter_mut().zip(up) {
+        *a = gelu(*a) * b;
+    }
+}
+
+/// `x *= s` (Gemma scales the embedding by `sqrt(dim)`).
+pub fn scale_inplace(x: &mut [f32], s: f32) {
+    for v in x {
+        *v *= s;
+    }
+}
+
 /// `x += y`.
 pub fn add_inplace(x: &mut [f32], y: &[f32]) {
     for (a, &b) in x.iter_mut().zip(y) {
@@ -144,18 +165,31 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// First cached position a query at `pos` may attend to: everything for a
+/// full-attention layer (`window == 0`), else the last `window` positions.
+#[inline]
+pub fn window_start(pos: usize, window: usize) -> usize {
+    if window > 0 && pos + 1 > window {
+        pos + 1 - window
+    } else {
+        0
+    }
+}
+
 /// Causal multi-head attention for the token at `pos` over the cache of
 /// `layer`. Heads are distributed across the pool; each head reads the
-/// query `q`, scores all cached keys, softmaxes and mixes cached values
+/// query `q`, scores the cached keys (all of them, or the last `window`
+/// positions for a sliding-window layer), softmaxes and mixes cached values
 /// into `out`.
 #[allow(clippy::too_many_arguments)]
-pub fn attention(pool: &Pool, out: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32], scores: &mut [f32], d: &Dims, ctx: usize, layer: usize, pos: usize) {
+pub fn attention(pool: &Pool, out: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32], scores: &mut [f32], d: &Dims, ctx: usize, layer: usize, pos: usize, window: usize) {
     let hd = d.head_dim;
     let kv = d.kv_dim();
     let gqa = d.gqa();
     let scale = 1.0 / (hd as f32).sqrt();
     let base = layer * ctx * kv;
     let n = pos + 1;
+    let t0 = window_start(pos, window);
     let o = SendPtr(out.as_mut_ptr());
     let sc = SendPtr(scores.as_mut_ptr());
     pool.run(&|tid, nth| {
@@ -163,16 +197,16 @@ pub fn attention(pool: &Pool, out: &mut [f32], q: &[f32], k_cache: &[f32], v_cac
             let kvh = h / gqa;
             let qh = &q[h * hd..(h + 1) * hd];
             // SAFETY: each head owns its own score row and output slice.
-            let s = unsafe { sc.slice_mut(h * ctx..h * ctx + n) };
-            for t in 0..n {
+            let s = unsafe { sc.slice_mut(h * ctx..h * ctx + n - t0) };
+            for t in t0..n {
                 let at = base + t * kv + kvh * hd;
-                s[t] = dot(qh, &k_cache[at..at + hd]) * scale;
+                s[t - t0] = dot(qh, &k_cache[at..at + hd]) * scale;
             }
             softmax(s);
             let oh = unsafe { o.slice_mut(h * hd..(h + 1) * hd) };
             oh.fill(0.0);
-            for t in 0..n {
-                let a = s[t];
+            for t in t0..n {
+                let a = s[t - t0];
                 let at = base + t * kv + kvh * hd;
                 let vt = &v_cache[at..at + hd];
                 for i in 0..hd {
@@ -261,7 +295,8 @@ mod tests {
 
     #[test]
     fn attention_single_token_returns_value() {
-        let d = Dims { dim: 8, hidden: 8, n_layer: 1, n_head: 2, n_kv_head: 1, head_dim: 4, rot_dim: 4, vocab: 1, n_ctx_train: 4, eps: 1e-5, rope_base: 10000.0, rope_scale: 1.0 };
+        let d =
+            Dims { dim: 8, hidden: 8, n_layer: 1, n_head: 2, n_kv_head: 1, head_dim: 4, rot_dim: 4, vocab: 1, n_ctx_train: 4, eps: 1e-5, rope_base: 10000.0, rope_scale: 1.0, swa_window: 0, rope_base_local: 10000.0, rope_scale_local: 1.0 };
         let ctx = 4;
         let pool = Pool::new(2);
         let q = vec![1.0f32; 8];
@@ -270,9 +305,48 @@ mod tests {
         store_kv(&mut kc, &mut vc, &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], &d, ctx, 0, 0);
         let mut scores = vec![0f32; 2 * ctx];
         let mut out = vec![0f32; 8];
-        attention(&pool, &mut out, &q, &kc, &vc, &mut scores, &d, ctx, 0, 0);
+        attention(&pool, &mut out, &q, &kc, &vc, &mut scores, &d, ctx, 0, 0, 0);
         assert_eq!(&out[..4], &[5.0, 6.0, 7.0, 8.0]);
         assert_eq!(&out[4..], &[5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn sliding_window_sees_only_recent_positions() {
+        let d =
+            Dims { dim: 8, hidden: 8, n_layer: 1, n_head: 2, n_kv_head: 1, head_dim: 4, rot_dim: 4, vocab: 1, n_ctx_train: 4, eps: 1e-5, rope_base: 10000.0, rope_scale: 1.0, swa_window: 1, rope_base_local: 10000.0, rope_scale_local: 1.0 };
+        let ctx = 4;
+        let pool = Pool::new(1);
+        let q = vec![1.0f32; 8];
+        let mut kc = vec![0f32; ctx * 4];
+        let mut vc = vec![0f32; ctx * 4];
+        store_kv(&mut kc, &mut vc, &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], &d, ctx, 0, 0);
+        store_kv(&mut kc, &mut vc, &[1.0, 2.0, 3.0, 4.0], &[1.0, 1.0, 1.0, 1.0], &d, ctx, 0, 1);
+        let mut scores = vec![0f32; 2 * ctx];
+        let mut out = vec![0f32; 8];
+        // Window 1 at pos 1: only position 1 is visible.
+        attention(&pool, &mut out, &q, &kc, &vc, &mut scores, &d, ctx, 0, 1, 1);
+        assert_eq!(&out[..4], &[1.0, 1.0, 1.0, 1.0]);
+        // Window 2 (or none): equal keys -> the average of both values.
+        attention(&pool, &mut out, &q, &kc, &vc, &mut scores, &d, ctx, 0, 1, 2);
+        assert_eq!(&out[..4], &[3.0, 3.5, 4.0, 4.5]);
+        let mut full = vec![0f32; 8];
+        attention(&pool, &mut full, &q, &kc, &vc, &mut scores, &d, ctx, 0, 1, 0);
+        assert_eq!(out, full);
+        // Batched rows agree with the single path under a window.
+        let mut rows = vec![0f32; 8];
+        attention_rows(&pool, &mut rows, &q, &kc, &vc, &mut scores, &d, ctx, 0, 1, 1, 1);
+        attention(&pool, &mut out, &q, &kc, &vc, &mut scores, &d, ctx, 0, 1, 1);
+        assert_eq!(rows, out);
+    }
+
+    #[test]
+    fn gelu_matches_formula() {
+        assert!((gelu(0.0)).abs() < 1e-7);
+        assert!((gelu(1.0) - 0.841_192).abs() < 1e-5);
+        assert!((gelu(-1.0) + 0.158_808).abs() < 1e-5);
+        let mut h = vec![1.0f32, -1.0];
+        gelu_mul(&mut h, &[2.0, 2.0]);
+        assert!((h[0] - 1.682_384).abs() < 1e-5 && (h[1] + 0.317_616).abs() < 1e-5);
     }
 }
 
@@ -360,6 +434,20 @@ pub fn silu_mul_par(pool: &Pool, h: &mut [f32], up: &[f32]) {
     });
 }
 
+/// [`gelu_mul`] over the pool.
+pub fn gelu_mul_par(pool: &Pool, h: &mut [f32], up: &[f32]) {
+    let n = h.len().min(up.len());
+    if n < 2 * PAR_CHUNK || pool.n_threads() == 1 {
+        return gelu_mul(&mut h[..n], &up[..n]);
+    }
+    let o = SendPtr(h.as_mut_ptr());
+    pool.run_chunks(n, PAR_CHUNK, &|range| {
+        // SAFETY: disjoint element ranges.
+        let dst = unsafe { o.slice_mut(range.clone()) };
+        gelu_mul(dst, &up[range]);
+    });
+}
+
 /// [`add_inplace`] over the pool.
 pub fn add_inplace_par(pool: &Pool, x: &mut [f32], y: &[f32]) {
     let n = x.len().min(y.len());
@@ -423,9 +511,10 @@ pub fn store_kv_rows(k_cache: &mut [f32], v_cache: &mut [f32], k: &[f32], v: &[f
 
 /// Causal attention for `m` query rows at positions `pos0 .. pos0 + m`
 /// (their keys/values must already be in the cache). Work items are
-/// (row, head) pairs; `scratch` needs `n_threads * ctx` floats.
+/// (row, head) pairs; `scratch` needs `n_threads * ctx` floats. `window`
+/// as in [`attention`].
 #[allow(clippy::too_many_arguments)]
-pub fn attention_rows(pool: &Pool, out: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32], scratch: &mut [f32], d: &Dims, ctx: usize, layer: usize, pos0: usize, m: usize) {
+pub fn attention_rows(pool: &Pool, out: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32], scratch: &mut [f32], d: &Dims, ctx: usize, layer: usize, pos0: usize, m: usize, window: usize) {
     let hd = d.head_dim;
     let kv = d.kv_dim();
     let qd = d.q_dim();
@@ -443,18 +532,19 @@ pub fn attention_rows(pool: &Pool, out: &mut [f32], q: &[f32], k_cache: &[f32], 
             let h = task % d.n_head;
             let kvh = h / gqa;
             let n = pos0 + i + 1;
+            let t0 = window_start(pos0 + i, window);
             let qh = &q[i * qd + h * hd..i * qd + (h + 1) * hd];
-            let s = &mut s_all[..n];
-            for t in 0..n {
+            let s = &mut s_all[..n - t0];
+            for t in t0..n {
                 let at = base + t * kv + kvh * hd;
-                s[t] = dot(qh, &k_cache[at..at + hd]) * scale;
+                s[t - t0] = dot(qh, &k_cache[at..at + hd]) * scale;
             }
             softmax(s);
             // SAFETY: each (row, head) output slice is owned by exactly one task.
             let oh = unsafe { o.slice_mut(i * qd + h * hd..i * qd + (h + 1) * hd) };
             oh.fill(0.0);
-            for t in 0..n {
-                let a = s[t];
+            for t in t0..n {
+                let a = s[t - t0];
                 let at = base + t * kv + kvh * hd;
                 let vt = &v_cache[at..at + hd];
                 for j in 0..hd {
@@ -492,6 +582,9 @@ mod batch_tests {
         silu_mul(&mut h1, &up);
         silu_mul_par(&pool, &mut h2, &up);
         assert!(h1.iter().zip(&h2).all(|(p, q)| p.to_bits() == q.to_bits()));
+        gelu_mul(&mut h1, &up);
+        gelu_mul_par(&pool, &mut h2, &up);
+        assert!(h1.iter().zip(&h2).all(|(p, q)| p.to_bits() == q.to_bits()));
         add_inplace(&mut h1, &up);
         add_inplace_par(&pool, &mut h2, &up);
         assert!(h1.iter().zip(&h2).all(|(p, q)| p.to_bits() == q.to_bits()));
@@ -507,7 +600,23 @@ mod batch_tests {
 
     #[test]
     fn attention_rows_matches_single_bitwise() {
-        let d = Dims { dim: 2048, hidden: 1, n_layer: 1, n_head: 32, n_kv_head: 4, head_dim: 64, rot_dim: 64, vocab: 1, n_ctx_train: 1, eps: 1e-5, rope_base: 1.0, rope_scale: 1.0 };
+        let d = Dims {
+            dim: 2048,
+            hidden: 1,
+            n_layer: 1,
+            n_head: 32,
+            n_kv_head: 4,
+            head_dim: 64,
+            rot_dim: 64,
+            vocab: 1,
+            n_ctx_train: 1,
+            eps: 1e-5,
+            rope_base: 1.0,
+            rope_scale: 1.0,
+            swa_window: 0,
+            rope_base_local: 10000.0,
+            rope_scale_local: 1.0,
+        };
         let ctx = 128;
         let kv = d.kv_dim();
         let pool = Pool::new(3);
@@ -518,9 +627,9 @@ mod batch_tests {
             let q: Vec<f32> = (0..d.q_dim()).map(|_| lcg(&mut seed) * 4.0).collect();
             let mut scratch = vec![0f32; 32 * ctx];
             let mut single = vec![0f32; d.q_dim()];
-            attention(&pool, &mut single, &q, &kc, &vc, &mut scratch, &d, ctx, 0, pos);
+            attention(&pool, &mut single, &q, &kc, &vc, &mut scratch, &d, ctx, 0, pos, 0);
             let mut batched = vec![0f32; d.q_dim()];
-            attention_rows(&pool, &mut batched, &q, &kc, &vc, &mut scratch, &d, ctx, 0, pos, 1);
+            attention_rows(&pool, &mut batched, &q, &kc, &vc, &mut scratch, &d, ctx, 0, pos, 1, 0);
             let diff = single.iter().zip(&batched).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
             assert_eq!(diff, 0, "pos {pos}: {diff} elements differ");
         }

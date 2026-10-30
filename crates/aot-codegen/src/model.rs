@@ -1,5 +1,5 @@
 //! Extraction of the Llama-family computational graph (Llama, Qwen2, Qwen3,
-//! Phi-3) from GGUF metadata.
+//! Phi-3, Gemma 3) from GGUF metadata.
 
 use anyhow::{anyhow, bail, Context, Result};
 use aot_gguf::{file_type_name, GgmlType, Gguf, TensorInfo};
@@ -138,6 +138,13 @@ pub struct LayerSpec {
     /// `ArchFlags::qk_norm`.
     pub q_norm: Option<TensorSpec>,
     pub k_norm: Option<TensorSpec>,
+    /// Post-attention / post-FFN RMSNorm weights, present when
+    /// `ArchFlags::post_norms`.
+    pub attn_post_norm: Option<TensorSpec>,
+    pub ffn_post_norm: Option<TensorSpec>,
+    /// Sliding-window (local) attention layer: attends to the last
+    /// `DimsSpec::swa_window` positions with the local RoPE table.
+    pub local_attn: bool,
 }
 
 /// Where a supported architecture deviates from the plain Llama block.
@@ -155,10 +162,21 @@ pub struct ArchFlags {
     /// generated code sees them as separate matrices (views into the blob).
     pub fused_qkv: bool,
     pub fused_gate_up: bool,
+    /// The embedding is scaled by `sqrt(dim)` (Gemma).
+    pub embd_scale: bool,
+    /// Attention and FFN outputs are RMS-normalised before the residual add
+    /// (`post_attention_norm`, `post_ffw_norm`: Gemma).
+    pub post_norms: bool,
+    /// GeGLU (`gelu(gate) * up`) instead of SwiGLU (Gemma).
+    pub gelu: bool,
+    /// Sliding-window attention: every `swa_pattern`-th layer attends to the
+    /// whole context, the others to the last `attention.sliding_window`
+    /// positions with their own RoPE base (Gemma 3: 6). 0 = no local layers.
+    pub swa_pattern: usize,
 }
 
 /// Architectures the code generator knows how to lower.
-pub const SUPPORTED_ARCHS: &[&str] = &["llama", "qwen2", "qwen3", "phi3"];
+pub const SUPPORTED_ARCHS: &[&str] = &["llama", "qwen2", "qwen3", "phi3", "gemma3"];
 
 impl ArchFlags {
     /// Flags for a `general.architecture` value, `None` when unsupported.
@@ -168,6 +186,7 @@ impl ArchFlags {
             "qwen2" => ArchFlags { rope_neox: true, qkv_bias: true, ..ArchFlags::default() },
             "qwen3" => ArchFlags { rope_neox: true, qk_norm: true, ..ArchFlags::default() },
             "phi3" => ArchFlags { rope_neox: true, fused_qkv: true, fused_gate_up: true, ..ArchFlags::default() },
+            "gemma3" => ArchFlags { rope_neox: true, qk_norm: true, embd_scale: true, post_norms: true, gelu: true, swa_pattern: 6, ..ArchFlags::default() },
             _ => return None,
         })
     }
@@ -187,6 +206,11 @@ pub struct DimsSpec {
     pub eps: f32,
     pub rope_base: f32,
     pub rope_scale: f32,
+    /// Window of the local attention layers (0 = none).
+    pub swa_window: usize,
+    /// RoPE base / scale of the local layers.
+    pub rope_base_local: f32,
+    pub rope_scale_local: f32,
 }
 
 /// Everything the emitter needs to generate a model module.
@@ -257,7 +281,7 @@ impl ModelSpec {
     pub fn from_gguf(g: &Gguf, source: &Path) -> Result<ModelSpec> {
         let arch = g.architecture().context("reading general.architecture")?.to_string();
         let Some(flags) = ArchFlags::for_arch(&arch) else {
-            bail!("unsupported architecture \"{arch}\": supported are {} (Llama 1/2/3, TinyLlama, Mistral, Qwen2/2.5, Qwen3, Phi-3)", SUPPORTED_ARCHS.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(", "));
+            bail!("unsupported architecture \"{arch}\": supported are {} (Llama 1/2/3, TinyLlama, Mistral, Qwen2/2.5, Qwen3, Phi-3, Gemma 3)", SUPPORTED_ARCHS.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(", "));
         };
         let mut warnings = Vec::new();
         if g.tensor("rope_factors_long.weight").is_some() || g.tensor("rope_factors_short.weight").is_some() {
@@ -286,6 +310,11 @@ impl ModelSpec {
         if !n_head.is_multiple_of(n_kv_head) {
             bail!("head_count {n_head} is not a multiple of head_count_kv {n_kv_head}");
         }
+        // Gemma 3: local layers (all but every 6th) use a 512 / 1024 window
+        // and RoPE base 10000 without scaling; the global layers use the
+        // metadata base and the linear factor read above.
+        let swa_window = if flags.swa_pattern > 0 { g.get_u64(&k("attention.sliding_window")).context("sliding-window architecture without attention.sliding_window")? as usize } else { 0 };
+        let (rope_base_local, rope_scale_local) = (10000.0f32, 1.0f32);
         if rot_dim > head_dim || !rot_dim.is_multiple_of(2) {
             bail!("invalid rope dimension count {rot_dim} for head_dim {head_dim}");
         }
@@ -318,6 +347,8 @@ impl ModelSpec {
             let b = |s: &str| format!("blk.{i}.{s}.bias");
             let (bq, bk, bv) = if flags.qkv_bias { (Some(vector(g, &b("attn_q"), q_dim)?), Some(vector(g, &b("attn_k"), kv_dim)?), Some(vector(g, &b("attn_v"), kv_dim)?)) } else { (None, None, None) };
             let (q_norm, k_norm) = if flags.qk_norm { (Some(vector(g, &p("attn_q_norm"), head_dim)?), Some(vector(g, &p("attn_k_norm"), head_dim)?)) } else { (None, None) };
+            let (attn_post_norm, ffn_post_norm) = if flags.post_norms { (Some(vector(g, &p("post_attention_norm"), dim)?), Some(vector(g, &p("post_ffw_norm"), dim)?)) } else { (None, None) };
+            let local_attn = flags.swa_pattern > 0 && (i + 1) % flags.swa_pattern != 0;
             let (wq, wk, wv) = if flags.fused_qkv {
                 let qkv = matrix(g, &p("attn_qkv"), q_dim + 2 * kv_dim, dim)?;
                 (rows_view(&qkv, 0, q_dim), rows_view(&qkv, q_dim, kv_dim), rows_view(&qkv, q_dim + kv_dim, kv_dim))
@@ -345,9 +376,12 @@ impl ModelSpec {
                 bv,
                 q_norm,
                 k_norm,
+                attn_post_norm,
+                ffn_post_norm,
+                local_attn,
             });
         }
-        let per_layer = 9 + if flags.qkv_bias { 3 } else { 0 } + if flags.qk_norm { 2 } else { 0 } - if flags.fused_qkv { 2 } else { 0 } - if flags.fused_gate_up { 1 } else { 0 };
+        let per_layer = 9 + if flags.qkv_bias { 3 } else { 0 } + if flags.qk_norm { 2 } else { 0 } + if flags.post_norms { 2 } else { 0 } - if flags.fused_qkv { 2 } else { 0 } - if flags.fused_gate_up { 1 } else { 0 };
         let used: usize = 3 + per_layer * n_layer + rope_freqs.is_some() as usize - output.is_none() as usize;
         if used != g.tensors.len() {
             // Anything the graph does not consume is ignored, except biases:
@@ -361,7 +395,7 @@ impl ModelSpec {
                     for t in [&l.attn_norm, &l.wq, &l.wk, &l.wv, &l.wo, &l.ffn_norm, &l.gate, &l.up, &l.down] {
                         v.push(t.name.clone());
                     }
-                    for t in [&l.bq, &l.bk, &l.bv, &l.q_norm, &l.k_norm].into_iter().flatten() {
+                    for t in [&l.bq, &l.bk, &l.bv, &l.q_norm, &l.k_norm, &l.attn_post_norm, &l.ffn_post_norm].into_iter().flatten() {
                         v.push(t.name.clone());
                     }
                 }
@@ -390,7 +424,7 @@ impl ModelSpec {
             flags,
             file_type,
             source: source.display().to_string(),
-            dims: DimsSpec { dim, hidden, n_layer, n_head, n_kv_head, head_dim, rot_dim, vocab, n_ctx_train, eps, rope_base, rope_scale },
+            dims: DimsSpec { dim, hidden, n_layer, n_head, n_kv_head, head_dim, rot_dim, vocab, n_ctx_train, eps, rope_base, rope_scale, swa_window, rope_base_local, rope_scale_local },
             token_embd,
             output_norm,
             output,
@@ -412,7 +446,7 @@ impl ModelSpec {
         v.extend(self.rope_freqs.iter());
         for l in &self.layers {
             v.extend([&l.attn_norm, &l.wq, &l.wk, &l.wv, &l.wo, &l.ffn_norm, &l.gate, &l.up, &l.down]);
-            v.extend([&l.bq, &l.bk, &l.bv, &l.q_norm, &l.k_norm].into_iter().flatten());
+            v.extend([&l.bq, &l.bk, &l.bv, &l.q_norm, &l.k_norm, &l.attn_post_norm, &l.ffn_post_norm].into_iter().flatten());
         }
         v
     }

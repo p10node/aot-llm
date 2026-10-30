@@ -8,6 +8,9 @@
 //! * `qwen3`: per-head q / k RMSNorm, NEOX RoPE, and a head size that makes
 //!   `q_dim` larger than `dim` (as in Qwen3-0.6B).
 //! * `phi3`: fused `attn_qkv` and `ffn_up` (gate + up) tensors, NEOX RoPE.
+//! * `gemma3`: scaled embedding, q/k norms, post-attention / post-FFN norms,
+//!   GeGLU, sliding-window layers with their own RoPE base and a global
+//!   layer with linear RoPE scaling (6 layers, so one of them is global).
 
 use aot_codegen::tokenizer::build_blob;
 use aot_gguf::writer::GgufWriter;
@@ -20,9 +23,9 @@ use std::process::Command;
 
 const DIM: usize = 256;
 const HIDDEN: usize = 512;
-const N_LAYER: usize = 2;
 const EPS: f32 = 1e-5;
-const ROPE_BASE: f32 = 10000.0;
+/// RoPE base of the local (sliding-window) layers; llama.cpp hardcodes it for Gemma 3.
+const LOCAL_ROPE_BASE: f32 = 10000.0;
 
 /// Architecture variant under test.
 #[derive(Clone, Copy)]
@@ -39,6 +42,20 @@ struct Cfg {
     qk_norm: bool,
     /// q/k/v written as one `attn_qkv` tensor and gate/up as one `ffn_up` (Phi-3).
     fused: bool,
+    n_layer: usize,
+    /// Gemma: embedding scaled by sqrt(dim), post-norms, GeGLU.
+    gemma: bool,
+    /// Sliding window of the local layers (every 6th layer is global); 0 = none.
+    swa_window: usize,
+    /// RoPE base and linear scale of the global layers.
+    rope_base: f32,
+    rope_scale: f32,
+}
+
+impl Cfg {
+    fn local_layer(&self, li: usize) -> bool {
+        self.swa_window > 0 && !(li + 1).is_multiple_of(6)
+    }
 }
 
 impl Cfg {
@@ -50,10 +67,12 @@ impl Cfg {
     }
 }
 
-const LLAMA: Cfg = Cfg { arch: "llama", n_head: 4, n_kv_head: 2, head_dim: 64, neox: false, bias: false, qk_norm: false, fused: false };
-const QWEN2: Cfg = Cfg { arch: "qwen2", n_head: 4, n_kv_head: 2, head_dim: 64, neox: true, bias: true, qk_norm: false, fused: false };
-const QWEN3: Cfg = Cfg { arch: "qwen3", n_head: 4, n_kv_head: 2, head_dim: 128, neox: true, bias: false, qk_norm: true, fused: false };
-const PHI3: Cfg = Cfg { arch: "phi3", n_head: 4, n_kv_head: 2, head_dim: 64, neox: true, bias: false, qk_norm: false, fused: true };
+const BASE: Cfg = Cfg { arch: "llama", n_head: 4, n_kv_head: 2, head_dim: 64, neox: false, bias: false, qk_norm: false, fused: false, n_layer: 2, gemma: false, swa_window: 0, rope_base: 10000.0, rope_scale: 1.0 };
+const LLAMA: Cfg = BASE;
+const QWEN2: Cfg = Cfg { arch: "qwen2", neox: true, bias: true, ..BASE };
+const QWEN3: Cfg = Cfg { arch: "qwen3", head_dim: 128, neox: true, qk_norm: true, ..BASE };
+const PHI3: Cfg = Cfg { arch: "phi3", neox: true, fused: true, ..BASE };
+const GEMMA3: Cfg = Cfg { arch: "gemma3", neox: true, qk_norm: true, n_layer: 6, gemma: true, swa_window: 4, rope_base: 1_000_000.0, rope_scale: 2.0, ..BASE };
 
 struct Rng(u64);
 impl Rng {
@@ -142,11 +161,11 @@ fn rmsnorm(x: &[f32], w: &[f32]) -> Vec<f32> {
 }
 
 /// RoPE over `n_heads` heads of `head_dim`, adjacent pairs or NEOX pairs.
-fn rope(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, neox: bool) {
+fn rope(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, neox: bool, base: f32, scale: f32) {
     let half = head_dim / 2;
     for h in 0..n_heads {
         for i in 0..half {
-            let theta = pos as f32 * ROPE_BASE.powf(-(2.0 * i as f32) / head_dim as f32);
+            let theta = (pos as f32 / scale) * base.powf(-(2.0 * i as f32) / head_dim as f32);
             let (s, c) = theta.sin_cos();
             let (i0, i1) = if neox { (i, i + half) } else { (2 * i, 2 * i + 1) };
             let a = x[h * head_dim + i0];
@@ -185,6 +204,8 @@ struct Layer {
     bv: Option<Vec<f32>>,
     q_norm: Option<Vec<f32>>,
     k_norm: Option<Vec<f32>>,
+    attn_post_norm: Option<Vec<f32>>,
+    ffn_post_norm: Option<Vec<f32>>,
 }
 
 struct Model {
@@ -200,12 +221,21 @@ fn reference_logits(m: &Model, tokens: &[u32], quant_acts: bool) -> Vec<f32> {
     let cfg = &m.cfg;
     let hd = cfg.head_dim;
     let kv_dim = cfg.kv_dim();
-    let mut k_cache = vec![vec![0f32; tokens.len() * kv_dim]; N_LAYER];
-    let mut v_cache = vec![vec![0f32; tokens.len() * kv_dim]; N_LAYER];
+    let mut k_cache = vec![vec![0f32; tokens.len() * kv_dim]; cfg.n_layer];
+    let mut v_cache = vec![vec![0f32; tokens.len() * kv_dim]; cfg.n_layer];
     let mut logits = Vec::new();
     for (pos, &t) in tokens.iter().enumerate() {
         let mut x: Vec<f32> = m.embd.f32[t as usize * DIM..(t as usize + 1) * DIM].to_vec();
+        if cfg.gemma {
+            let s = (DIM as f32).sqrt();
+            for v in x.iter_mut() {
+                *v *= s;
+            }
+        }
         for (li, l) in m.layers.iter().enumerate() {
+            let local = cfg.local_layer(li);
+            let (base, scale) = if local { (LOCAL_ROPE_BASE, 1.0) } else { (cfg.rope_base, cfg.rope_scale) };
+            let t_start = if local && pos + 1 > cfg.swa_window { pos + 1 - cfg.swa_window } else { 0 };
             let xb = rmsnorm(&x, &l.attn_norm);
             let mut q = matvec(&l.wq, &xb, quant_acts);
             let mut k = matvec(&l.wk, &xb, quant_acts);
@@ -219,15 +249,15 @@ fn reference_logits(m: &Model, tokens: &[u32], quant_acts: bool) -> Vec<f32> {
                 norm_heads(&mut q, qn, cfg.n_head, hd);
                 norm_heads(&mut k, kn, cfg.n_kv_head, hd);
             }
-            rope(&mut q, cfg.n_head, hd, pos, cfg.neox);
-            rope(&mut k, cfg.n_kv_head, hd, pos, cfg.neox);
+            rope(&mut q, cfg.n_head, hd, pos, cfg.neox, base, scale);
+            rope(&mut k, cfg.n_kv_head, hd, pos, cfg.neox, base, scale);
             k_cache[li][pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&k);
             v_cache[li][pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&v);
             let mut att = vec![0f32; cfg.q_dim()];
             for h in 0..cfg.n_head {
                 let kvh = h / (cfg.n_head / cfg.n_kv_head);
                 let qh = &q[h * hd..(h + 1) * hd];
-                let mut sc: Vec<f32> = (0..=pos)
+                let mut sc: Vec<f32> = (t_start..=pos)
                     .map(|tp| {
                         let kt = &k_cache[li][tp * kv_dim + kvh * hd..tp * kv_dim + (kvh + 1) * hd];
                         qh.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() / (hd as f32).sqrt()
@@ -239,7 +269,7 @@ fn reference_logits(m: &Model, tokens: &[u32], quant_acts: bool) -> Vec<f32> {
                     *s = (*s - mx).exp();
                     sum += *s;
                 }
-                for (tp, s) in sc.iter().enumerate() {
+                for (tp, s) in (t_start..).zip(sc.iter()) {
                     let vt = &v_cache[li][tp * kv_dim + kvh * hd..tp * kv_dim + (kvh + 1) * hd];
                     for i in 0..hd {
                         att[h * hd + i] += s / sum * vt[i];
@@ -247,12 +277,21 @@ fn reference_logits(m: &Model, tokens: &[u32], quant_acts: bool) -> Vec<f32> {
                 }
             }
             let o = matvec(&l.wo, &att, quant_acts);
+            let o = match &l.attn_post_norm {
+                Some(w) => rmsnorm(&o, w),
+                None => o,
+            };
             add(&mut x, &o);
             let xb = rmsnorm(&x, &l.ffn_norm);
             let g = matvec(&l.gate, &xb, quant_acts);
             let u = matvec(&l.up, &xb, quant_acts);
-            let hbuf: Vec<f32> = g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
+            let hbuf: Vec<f32> =
+                if cfg.gemma { g.iter().zip(&u).map(|(g, u)| 0.5 * g * (1.0 + (0.797_884_6f32 * (g + 0.044715 * g * g * g)).tanh()) * u).collect() } else { g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect() };
             let d = matvec(&l.down, &hbuf, quant_acts);
+            let d = match &l.ffn_post_norm {
+                Some(w) => rmsnorm(&d, w),
+                None => d,
+            };
             add(&mut x, &d);
         }
         if pos + 1 == tokens.len() {
@@ -273,11 +312,11 @@ fn build_gguf(m: &Model, vocab: &[String], scores: &[f32], types: &[i32]) -> Vec
         .kv("general.file_type", MetaValue::U32(15))
         .kv(&format!("{arch}.embedding_length"), MetaValue::U32(DIM as u32))
         .kv(&format!("{arch}.feed_forward_length"), MetaValue::U32(HIDDEN as u32))
-        .kv(&format!("{arch}.block_count"), MetaValue::U32(N_LAYER as u32))
+        .kv(&format!("{arch}.block_count"), MetaValue::U32(cfg.n_layer as u32))
         .kv(&format!("{arch}.attention.head_count"), MetaValue::U32(cfg.n_head as u32))
         .kv(&format!("{arch}.attention.head_count_kv"), MetaValue::U32(cfg.n_kv_head as u32))
         .kv(&format!("{arch}.attention.layer_norm_rms_epsilon"), MetaValue::F32(EPS))
-        .kv(&format!("{arch}.rope.freq_base"), MetaValue::F32(ROPE_BASE))
+        .kv(&format!("{arch}.rope.freq_base"), MetaValue::F32(cfg.rope_base))
         .kv(&format!("{arch}.context_length"), MetaValue::U32(64))
         .kv("tokenizer.ggml.model", s("llama"))
         .kv("tokenizer.ggml.tokens", MetaValue::Array(vocab.iter().map(|t| s(t)).collect()))
@@ -291,6 +330,13 @@ fn build_gguf(m: &Model, vocab: &[String], scores: &[f32], types: &[i32]) -> Vec
         w.kv(&format!("{arch}.attention.value_length"), MetaValue::U32(cfg.head_dim as u32));
     } else {
         w.kv(&format!("{arch}.rope.dimension_count"), MetaValue::U32(cfg.head_dim as u32));
+    }
+    if cfg.swa_window > 0 {
+        w.kv(&format!("{arch}.attention.sliding_window"), MetaValue::U32(cfg.swa_window as u32));
+    }
+    if cfg.rope_scale != 1.0 {
+        w.kv(&format!("{arch}.rope.scaling.type"), s("linear"));
+        w.kv(&format!("{arch}.rope.scaling.factor"), MetaValue::F32(cfg.rope_scale));
     }
     let f32b = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
     w.tensor("token_embd.weight", &[DIM as u64, vocab.len() as u64], ggml(m.embd.kind), m.embd.bytes.clone());
@@ -330,6 +376,10 @@ fn build_gguf(m: &Model, vocab: &[String], scores: &[f32], types: &[i32]) -> Vec
             w.tensor(&n("attn_q_norm"), &[qn.len() as u64], GgmlType::F32, f32b(qn));
             w.tensor(&n("attn_k_norm"), &[kn.len() as u64], GgmlType::F32, f32b(kn));
         }
+        if let (Some(pa), Some(pf)) = (&l.attn_post_norm, &l.ffn_post_norm) {
+            w.tensor(&n("post_attention_norm"), &[pa.len() as u64], GgmlType::F32, f32b(pa));
+            w.tensor(&n("post_ffw_norm"), &[pf.len() as u64], GgmlType::F32, f32b(pf));
+        }
     }
     w.finish()
 }
@@ -342,8 +392,8 @@ fn build_model(cfg: Cfg, rng: &mut Rng, vocab_n: usize) -> Model {
     let optn = |rng: &mut Rng, on: bool, n: usize| -> Option<Vec<f32>> { on.then(|| norm(rng, n)) };
     // Layer 0 exercises the quantized kernels, layer 1 the float / Q8_0 / Q4_0 ones.
     let kinds = [[Kind::Q4_K, Kind::Q4_0, Kind::Q8_0, Kind::Q5_K, Kind::Q4_K, Kind::Q4_K, Kind::Q6_K], [Kind::F16, Kind::BF16, Kind::F32, Kind::Q4_0, Kind::Q8_0, Kind::Q8_0, Kind::Q5_0]];
-    let layers = kinds
-        .iter()
+    let layers = (0..cfg.n_layer)
+        .map(|li| &kinds[li % 2])
         .map(|k| Layer {
             attn_norm: norm(rng, DIM),
             wq: mat(rng, q_dim, DIM, k[0], 0.2),
@@ -360,6 +410,8 @@ fn build_model(cfg: Cfg, rng: &mut Rng, vocab_n: usize) -> Model {
             bv: opt(rng, cfg.bias, kv_dim, 0.3),
             q_norm: optn(rng, cfg.qk_norm, cfg.head_dim),
             k_norm: optn(rng, cfg.qk_norm, cfg.head_dim),
+            attn_post_norm: optn(rng, cfg.gemma, DIM),
+            ffn_post_norm: optn(rng, cfg.gemma, DIM),
         })
         .collect();
     Model { cfg, embd: mat(rng, vocab_n, DIM, Kind::Q4_K, 1.0), output_norm: norm(rng, DIM), output: mat(rng, vocab_n, DIM, Kind::Q6_K, 0.2), layers }
@@ -426,7 +478,8 @@ fn compile_run_and_match_reference(cfg: Cfg) {
     let parsed = GgufFile::parse(&gguf, gguf.len() as u64).unwrap();
     let (blob, _) = build_blob(&parsed).unwrap();
     let tok = Tokenizer::new(Box::leak(blob.into_boxed_slice())).unwrap();
-    let repeat: usize = std::env::var("E2E_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    // The Gemma prompt repeats so that it is longer than the sliding window.
+    let repeat: usize = std::env::var("E2E_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(if cfg.swa_window > 0 { 2 } else { 1 });
     let prompt = vec!["the capital of hello world is"; repeat].join(" ");
     let ids = tok.encode(&prompt, true, true);
     assert_eq!(ids.len(), 1 + 6 * repeat, "{ids:?}");
@@ -698,4 +751,9 @@ fn qwen3_compile_run_and_match_reference() {
 #[test]
 fn phi3_compile_run_and_match_reference() {
     compile_run_and_match_reference(PHI3);
+}
+
+#[test]
+fn gemma3_compile_run_and_match_reference() {
+    compile_run_and_match_reference(GEMMA3);
 }

@@ -138,6 +138,13 @@ pub struct Dims {
     pub rope_base: f32,
     /// Linear RoPE scaling factor (positions are divided by it). 1.0 = none.
     pub rope_scale: f32,
+    /// Sliding-window size of the local attention layers (Gemma 3); 0 when
+    /// every layer attends to the whole context.
+    pub swa_window: usize,
+    /// RoPE base and linear scale of the local (sliding-window) layers; the
+    /// global layers use `rope_base` / `rope_scale`.
+    pub rope_base_local: f32,
+    pub rope_scale_local: f32,
 }
 
 impl Dims {
@@ -270,6 +277,9 @@ pub struct State {
     pub inv_freq: Vec<f32>,
     /// Interleaved (cos, sin) for the current position, `rot_dim`.
     pub rope_cs: Buf<f32>,
+    /// The same for the sliding-window layers (empty without `swa_window`).
+    pub inv_freq_local: Vec<f32>,
+    pub rope_cs_local: Buf<f32>,
     /// Largest number of prompt tokens processed in one batched step.
     pub max_batch: usize,
     /// Batched activations (`max_batch` rows each); empty when `max_batch == 1`.
@@ -282,6 +292,7 @@ pub struct State {
     pub bhb: Buf<f32>,
     pub bhb2: Buf<f32>,
     pub brope_cs: Buf<f32>,
+    pub brope_cs_local: Buf<f32>,
     pub baq0: Vec<BlockQ8_0>,
     pub baqk: Vec<BlockQ8_K>,
 }
@@ -294,14 +305,19 @@ impl State {
         let max_batch = max_batch.max(1);
         let b = if max_batch > 1 { max_batch } else { 0 };
         let half = d.rot_dim / 2;
-        let mut inv_freq = Vec::with_capacity(half);
-        for i in 0..half {
-            let mut f = d.rope_base.powf(-(2.0 * i as f32) / d.rot_dim as f32);
-            if let Some(ff) = rope_freq_factors {
-                f /= ff[i];
-            }
-            inv_freq.push(f);
-        }
+        let table = |base: f32| -> Vec<f32> {
+            (0..half)
+                .map(|i| {
+                    let mut f = base.powf(-(2.0 * i as f32) / d.rot_dim as f32);
+                    if let Some(ff) = rope_freq_factors {
+                        f /= ff[i];
+                    }
+                    f
+                })
+                .collect()
+        };
+        let inv_freq = table(d.rope_base);
+        let (inv_freq_local, local_len) = if d.swa_window > 0 { (table(d.rope_base_local), d.rot_dim) } else { (Vec::new(), 0) };
         State {
             ctx,
             x: Buf::zeroed(d.dim),
@@ -320,6 +336,8 @@ impl State {
             aqk: Vec::new(),
             inv_freq,
             rope_cs: Buf::zeroed(d.rot_dim),
+            inv_freq_local,
+            rope_cs_local: Buf::zeroed(local_len),
             max_batch,
             bx: Buf::zeroed(b * d.dim),
             bxb: Buf::zeroed(b * d.dim.max(d.q_dim())),
@@ -330,6 +348,7 @@ impl State {
             bhb: Buf::zeroed(b * d.hidden),
             bhb2: Buf::zeroed(b * d.hidden),
             brope_cs: Buf::zeroed(b * d.rot_dim),
+            brope_cs_local: Buf::zeroed(b * local_len),
             baq0: Vec::new(),
             baqk: Vec::new(),
         }

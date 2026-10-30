@@ -476,6 +476,159 @@ fn llama_compile_run_and_match_reference() {
     compile_run_and_match_reference(LLAMA);
 }
 
+/// C program against the model library: tokenize, evaluate, read the logits
+/// and run the convenience generator.
+const C_CLIENT: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "aot_llm.h"
+
+static int count_cb(const char *piece, size_t len, uint32_t token, void *user) {
+    (void)piece; (void)len; (void)token;
+    (*(int *)user)++;
+    return 0;
+}
+
+static int collect_cb(const char *piece, size_t len, uint32_t token, void *user) {
+    (void)token;
+    strncat((char *)user, piece, len);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    aot_model_params mp = aot_model_default_params();
+    mp.n_threads = 2;
+    mp.device = AOT_DEVICE_CPU;
+    aot_model *m = aot_open(&mp);
+    if (!m) { fprintf(stderr, "open: %s\n", aot_last_error()); return 1; }
+    aot_model_info info;
+    aot_model_info_get(m, &info);
+    uint32_t ids[256];
+    int32_t n = aot_tokenize(m, argv[1], 0, 1, 1, ids, 256);
+    if (n <= 0 || n > 256) { fprintf(stderr, "tokenize: %s\n", aot_last_error()); return 1; }
+    printf("TOKENS");
+    for (int32_t i = 0; i < n; i++) printf(" %u", ids[i]);
+    printf("\n");
+    aot_ctx *c = aot_ctx_new(m, 64, 128);
+    if (!c) { fprintf(stderr, "ctx: %s\n", aot_last_error()); return 1; }
+    if (aot_eval(c, ids, (size_t)n, 1) != 0) { fprintf(stderr, "eval: %s\n", aot_last_error()); return 1; }
+    if (aot_ctx_n_past(c) != (uint32_t)n) { fprintf(stderr, "n_past %u\n", aot_ctx_n_past(c)); return 1; }
+    const float *logits = aot_logits(c);
+    printf("LOGITS");
+    for (uint32_t i = 0; i < info.n_vocab; i++) printf(" %.6f", logits[i]);
+    printf("\n");
+    /* Token by token must give the same logits. */
+    aot_ctx_reset(c);
+    for (int32_t i = 0; i < n; i++)
+        if (aot_eval(c, &ids[i], 1, i + 1 == n) != 0) { fprintf(stderr, "eval1: %s\n", aot_last_error()); return 1; }
+    printf("LOGITS1");
+    for (uint32_t i = 0; i < info.n_vocab; i++) printf(" %.6f", aot_logits(c)[i]);
+    printf("\n");
+    /* Save the sequence, load it into a fresh context: same logits. */
+    if (aot_ctx_save(c, argv[2]) != 0) { fprintf(stderr, "save: %s\n", aot_last_error()); return 1; }
+    aot_ctx *c2 = aot_ctx_new(m, 64, 128);
+    if (aot_ctx_load(c2, argv[2]) != 0) { fprintf(stderr, "load: %s\n", aot_last_error()); return 1; }
+    if (aot_ctx_n_past(c2) != (uint32_t)n) { fprintf(stderr, "loaded n_past %u\n", aot_ctx_n_past(c2)); return 1; }
+    printf("LOGITS2");
+    for (uint32_t i = 0; i < info.n_vocab; i++) printf(" %.6f", aot_logits(c2)[i]);
+    printf("\n");
+    aot_ctx_free(c2);
+    aot_ctx_reset(c);
+    aot_generate_params gp = aot_generate_default_params();
+    gp.max_tokens = 5;
+    gp.add_bos = 1;
+    int seen = 0;
+    int32_t gen = aot_generate(c, argv[1], 0, &gp, count_cb, &seen);
+    if (gen < 0) { fprintf(stderr, "generate: %s\n", aot_last_error()); return 1; }
+    printf("GEN %d %d %u\n", gen, seen, aot_ctx_n_past(c));
+    /* Constrained answer: exactly one of the choices. */
+    aot_ctx_reset(c);
+    const char *choices[2] = { "hello", "world" };
+    gp.choices = choices; gp.n_choices = 2; gp.max_tokens = 8;
+    char text[256]; text[0] = 0;
+    int32_t gen2 = aot_generate(c, argv[1], 0, &gp, collect_cb, text);
+    if (gen2 < 0) { fprintf(stderr, "generate choices: %s\n", aot_last_error()); return 1; }
+    printf("CHOICE %s\n", text);
+    char buf[64];
+    int32_t len = aot_token_piece(m, ids[n - 1], buf, sizeof buf);
+    printf("PIECE %.*s\n", len > 0 ? (int)len : 0, buf);
+    aot_ctx_free(c);
+    aot_close(m);
+    return 0;
+}
+"#;
+
+#[test]
+fn lib_c_api_matches_reference() {
+    let Ok(cc) = which_cc() else {
+        eprintln!("skipping: no C compiler found");
+        return;
+    };
+    let cfg = LLAMA;
+    let mut rng = Rng(0x5EED);
+    let (vocab, scores, types) = vocab();
+    let model = build_model(cfg, &mut rng, vocab.len());
+    let gguf = build_gguf(&model, &vocab, &scores, &types);
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-lib");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let gguf_path = tmp.join("tiny.gguf");
+    std::fs::write(&gguf_path, &gguf).unwrap();
+    let out = tmp.join("libdir");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_aot-llm")).args(["compile", "--model"]).arg(&gguf_path).arg("--output").arg(&out).args(["--quiet", "--lib", "--name", "tinymodel"]).status().expect("running aot-llm");
+    assert!(status.success(), "aot-llm compile --lib failed");
+    let lib = out.join(if cfg!(target_os = "windows") { "tinymodel.lib" } else { "libtinymodel.a" });
+    assert!(lib.exists(), "{} missing", lib.display());
+    assert!(out.join("aot_llm.h").exists());
+
+    let c_src = tmp.join("client.c");
+    std::fs::write(&c_src, C_CLIENT).unwrap();
+    let exe = tmp.join("client");
+    let mut cmd = Command::new(&cc);
+    cmd.arg("-O1").arg(&c_src).arg("-I").arg(&out).arg(&lib).arg("-o").arg(&exe);
+    if cfg!(target_os = "linux") {
+        cmd.args(["-lpthread", "-ldl", "-lm"]);
+    }
+    let cc_out = cmd.output().expect("running the C compiler");
+    assert!(cc_out.status.success(), "cc failed: {}", String::from_utf8_lossy(&cc_out.stderr));
+
+    let parsed = GgufFile::parse(&gguf, gguf.len() as u64).unwrap();
+    let (blob, _) = build_blob(&parsed).unwrap();
+    let tok = Tokenizer::new(Box::leak(blob.into_boxed_slice())).unwrap();
+    let prompt = "the capital of hello world is";
+    let ids = tok.encode(prompt, true, true);
+    let expected = reference_logits(&model, &ids, true);
+
+    let kv_path = tmp.join("client.kv");
+    let run = Command::new(&exe).arg(prompt).arg(&kv_path).output().expect("running the C client");
+    assert!(run.status.success(), "client failed: {}", String::from_utf8_lossy(&run.stderr));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let mut lines = stdout.lines();
+    let toks: Vec<u32> = lines.next().unwrap().strip_prefix("TOKENS ").unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
+    assert_eq!(toks, ids, "C tokenizer differs");
+    let got: Vec<f32> = lines.next().unwrap().strip_prefix("LOGITS ").unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
+    check_logits("lib batched", &got, &expected);
+    let got1: Vec<f32> = lines.next().unwrap().strip_prefix("LOGITS1 ").unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
+    check_logits("lib token by token", &got1, &expected);
+    let got2: Vec<f32> = lines.next().unwrap().strip_prefix("LOGITS2 ").unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
+    assert_eq!(got2, got, "logits after aot_ctx_save / aot_ctx_load differ");
+    let gen = lines.next().unwrap();
+    let parts: Vec<usize> = gen.strip_prefix("GEN ").unwrap().split(' ').map(|v| v.parse().unwrap()).collect();
+    assert!((1..=5).contains(&parts[0]), "{gen}");
+    // Byte tokens of the tiny vocabulary can form incomplete UTF-8 sequences,
+    // which the generator buffers, so the callback may fire fewer times.
+    assert!(parts[1] >= 1 && parts[1] <= parts[0], "callback count: {gen}");
+    // After generation the context holds the prompt plus the generated tokens
+    // that were fed back (all but the last one).
+    assert_eq!(parts[2], ids.len() + parts[0] - 1, "{gen}");
+    let choice = lines.next().unwrap();
+    assert!(choice == "CHOICE hello" || choice == "CHOICE world", "{choice}");
+    let piece = lines.next().unwrap();
+    assert_eq!(piece, format!("PIECE {}", tok.decode(&ids[ids.len() - 1..], false)));
+}
+
 /// The CLI's output constraints and the saved-run continuation.
 #[test]
 fn cli_stop_choices_and_kv_continuation() {
@@ -518,6 +671,18 @@ fn cli_stop_choices_and_kv_continuation() {
     let continued = run(&["--load-kv", kv_s, "--prompt", "of hello world is", "--dump-logits", "-q"]);
     let whole = run(&["--prompt", "the capital of hello world is", "--dump-logits", "-q"]);
     assert_eq!(continued, whole, "--load-kv continuation differs from the whole prompt");
+}
+
+fn which_cc() -> Result<PathBuf, ()> {
+    for c in [std::env::var("CC").unwrap_or_default(), "cc".into(), "clang".into(), "gcc".into()] {
+        if c.is_empty() {
+            continue;
+        }
+        if Command::new(&c).arg("--version").output().is_ok_and(|o| o.status.success()) {
+            return Ok(PathBuf::from(c));
+        }
+    }
+    Err(())
 }
 
 #[test]

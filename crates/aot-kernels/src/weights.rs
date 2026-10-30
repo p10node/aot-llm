@@ -72,21 +72,41 @@ pub fn map_own_section(segment: &str, section: &str, len: usize) -> std::io::Res
         reserved: [u32; 3],
     }
     extern "C" {
-        fn getsectbyname(segname: *const std::os::raw::c_char, sectname: *const std::os::raw::c_char) -> *const Section64;
+        fn _dyld_image_count() -> u32;
+        fn _dyld_get_image_header(i: u32) -> *const std::os::raw::c_void;
+        fn _dyld_get_image_name(i: u32) -> *const std::os::raw::c_char;
+        fn getsectbynamefromheader_64(mhp: *const std::os::raw::c_void, segname: *const std::os::raw::c_char, sectname: *const std::os::raw::c_char) -> *const Section64;
     }
     const PAGE: u64 = 16384;
     let seg = CString::new(segment)?;
     let sect = CString::new(section)?;
-    // SAFETY: looks the section up in the main executable's load commands.
-    let sc = unsafe { getsectbyname(seg.as_ptr(), sect.as_ptr()) };
-    if sc.is_null() {
-        return Err(Error::new(ErrorKind::NotFound, format!("section {segment},{section} not found")));
-    }
-    let (off, size) = unsafe { ((*sc).offset as u64, (*sc).size as usize) };
+    // The section lives in whichever image contains this code: the main
+    // executable, or a model library (`--lib shared`) loaded as a dylib.
+    // SAFETY: dyld bookkeeping calls over the loaded images.
+    let found = unsafe {
+        (0.._dyld_image_count()).find_map(|i| {
+            let h = _dyld_get_image_header(i);
+            if h.is_null() {
+                return None;
+            }
+            let sc = getsectbynamefromheader_64(h, seg.as_ptr(), sect.as_ptr());
+            if sc.is_null() {
+                return None;
+            }
+            let name = _dyld_get_image_name(i);
+            if name.is_null() {
+                return None;
+            }
+            Some(((*sc).offset as u64, (*sc).size as usize, std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()))
+        })
+    };
+    let Some((off, size, path)) = found else {
+        return Err(Error::new(ErrorKind::NotFound, format!("section {segment},{section} not found in any loaded image")));
+    };
     if size < len || off % PAGE != 0 {
         return Err(Error::new(ErrorKind::InvalidData, format!("section {segment},{section}: size {size}, file offset {off}")));
     }
-    let f = std::fs::File::open(std::env::current_exe()?)?;
+    let f = std::fs::File::open(&path)?;
     map_range(&f, off, len)
 }
 

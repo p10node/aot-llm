@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use aot_codegen::build::{cargo_build, BuildOptions};
-use aot_codegen::emit::{crate_name_from, write_project, EmitOptions, GpuBackend};
+use aot_codegen::emit::{crate_name_from, write_project, EmitOptions, GpuBackend, LibKind};
 use aot_codegen::model::ModelSpec;
 use aot_codegen::tokenizer::{build_blob, chat_format_name};
 use aot_gguf::{Gguf, MetaValue};
@@ -18,6 +18,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Compile a GGUF model into a standalone executable.
     Compile {
@@ -66,6 +67,16 @@ enum Cmd {
         /// CPU path (`--device cpu`).
         #[arg(long, value_name = "BACKEND")]
         gpu: Option<String>,
+        /// Build a model library with a C API (`aot_llm.h`) instead of an
+        /// executable: `static` (lib<name>.a, default) or `shared`
+        /// (lib<name>.dylib / .so). <output> is then a directory.
+        #[arg(long, value_name = "KIND", num_args = 0..=1, default_missing_value = "static")]
+        lib: Option<String>,
+        /// With --lib: prefix for the exported C symbols and header names
+        /// (e.g. `qwen3_` gives `qwen3_aot_open`), so that several model
+        /// libraries can be linked into one program.
+        #[arg(long, value_name = "PREFIX", requires = "lib")]
+        symbol_prefix: Option<String>,
     },
     /// Print metadata and tensors of a GGUF file.
     Inspect {
@@ -94,8 +105,8 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Compile { model, output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix, gpu } => {
-            compile(&model, &output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix, gpu)
+        Cmd::Compile { model, output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix, gpu, lib, symbol_prefix } => {
+            compile(&model, &output, build_dir, target, native, sidecar, emit_only, jobs, quiet, name, system, prefix, gpu, lib, symbol_prefix)
         }
         Cmd::Inspect { model, tensors, metadata } => inspect(&model, tensors, metadata),
         Cmd::Tokenize { model, text, no_bos, chat } => tokenize(&model, &text, no_bos, chat),
@@ -132,8 +143,18 @@ fn compile(
     system: Option<String>,
     prefix: Option<String>,
     gpu: Option<String>,
+    lib: Option<String>,
+    symbol_prefix: Option<String>,
 ) -> Result<()> {
     let t0 = Instant::now();
+    let symbol_prefix = symbol_prefix.unwrap_or_default();
+    if !symbol_prefix.is_empty() && !(symbol_prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !symbol_prefix.starts_with(|c: char| c.is_ascii_digit())) {
+        bail!("--symbol-prefix must be a C identifier prefix (letters, digits, underscores)");
+    }
+    let lib = match lib.as_deref() {
+        None => None,
+        Some(k) => Some(LibKind::parse(k).ok_or_else(|| anyhow::anyhow!("unknown library kind {k:?} (static | shared)"))?),
+    };
     let gpu = match gpu.as_deref() {
         None => None,
         Some("metal") => {
@@ -196,23 +217,42 @@ fn compile(
         PathBuf::from(s)
     });
     let crate_name = name.unwrap_or_else(|| crate_name_from(&output.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
-    let mut opts = EmitOptions { crate_name: crate_name.clone(), sidecar, native, gguf_path: model.clone(), compiler_version: aot_codegen::VERSION.to_string(), target: target.clone(), prefix_kv_path: None, gpu };
+    let bake = system.is_some() || prefix.is_some();
+    // With --lib and a baked prefix, pass 1 is a plain executable (it has to
+    // run to evaluate the prefix); pass 2 emits the library.
+    let pass1_lib = if bake { None } else { lib };
+    let mut opts = EmitOptions {
+        crate_name: crate_name.clone(),
+        sidecar,
+        native,
+        gguf_path: model.clone(),
+        compiler_version: aot_codegen::VERSION.to_string(),
+        target: target.clone(),
+        prefix_kv_path: None,
+        gpu,
+        lib: pass1_lib,
+        symbol_prefix: symbol_prefix.clone(),
+    };
     write_project(&dir, &spec, &blob, &opts).with_context(|| format!("writing project to {}", dir.display()))?;
     eprintln!(
-        "[3/4] generated project in {} (crate `{crate_name}`, {} layers unrolled, weights {}{})",
+        "[3/4] generated project in {} (crate `{crate_name}`, {} layers unrolled, weights {}{}{})",
         dir.display(),
         d.n_layer,
         if sidecar { "sidecar" } else { "embedded" },
-        gpu.map(|g| format!(", gpu: {}", g.name())).unwrap_or_default()
+        gpu.map(|g| format!(", gpu: {}", g.name())).unwrap_or_default(),
+        lib.map(|k| format!(", {} library + C API", if k == LibKind::Static { "static" } else { "shared" })).unwrap_or_default()
     );
     if emit_only {
+        if bake && lib.is_some() {
+            opts.lib = lib;
+            write_project(&dir, &spec, &blob, &opts)?;
+        }
         eprintln!("      --emit-only: skipping cargo build");
         return Ok(());
     }
 
-    let bake = system.is_some() || prefix.is_some();
     eprintln!("[4/4] cargo build --release{}{}{} ...", target.as_ref().map(|t| format!(" --target {t}")).unwrap_or_default(), if native { " (target-cpu=native)" } else { "" }, if bake { " (pass 1 of 2)" } else { "" });
-    let mut built = cargo_build(&dir, &crate_name, &BuildOptions { target: target.clone(), jobs, quiet, cargo: None })?;
+    let mut built = cargo_build(&dir, &crate_name, &BuildOptions { target: target.clone(), jobs, quiet, cargo: None, lib: pass1_lib })?;
 
     if bake {
         // Pass 1 produced a binary without a prefix cache; use it to evaluate
@@ -245,10 +285,35 @@ fn compile(
         }
         let _ = std::fs::remove_file(dir.join("weights.tmp"));
         opts.prefix_kv_path = Some(kv_path.clone());
+        opts.lib = lib;
         write_project(&dir, &spec, &blob, &opts)?;
-        eprintln!("      cargo build --release (pass 2 of 2, embedding {}) ...", human(std::fs::metadata(&kv_path)?.len()));
-        built = cargo_build(&dir, &crate_name, &BuildOptions { target: target.clone(), jobs, quiet, cargo: None })?;
+        eprintln!("      cargo build --release (pass 2 of 2, embedding {}{}) ...", human(std::fs::metadata(&kv_path)?.len()), if lib.is_some() { ", library" } else { "" });
+        built = cargo_build(&dir, &crate_name, &BuildOptions { target: target.clone(), jobs, quiet, cargo: None, lib })?;
     }
+
+    if let Some(kind) = lib {
+        // Library: <output>/ holds the library, the header and (sidecar) the weights.
+        std::fs::create_dir_all(output).with_context(|| format!("creating {}", output.display()))?;
+        let lib_name = kind.file_name(&crate_name, target.as_deref());
+        let lib_path = output.join(&lib_name);
+        std::fs::copy(&built.binary, &lib_path).with_context(|| format!("copying library to {}", lib_path.display()))?;
+        std::fs::write(output.join("aot_llm.h"), aot_codegen::emit::c_header(&symbol_prefix))?;
+        if sidecar {
+            let wp = output.join(format!("{crate_name}.weights"));
+            std::fs::write(&wp, g.data_section()).with_context(|| format!("writing {}", wp.display()))?;
+            eprintln!("      wrote sidecar weights {} ({}); pass its path in aot_model_params.weights_path", wp.display(), human(spec.data_len));
+        }
+        let size = std::fs::metadata(&lib_path)?.len();
+        let linux = target.as_deref().map(|t| t.contains("linux")).unwrap_or(cfg!(target_os = "linux"));
+        let extra = if linux { " -lpthread -ldl -lm" } else { "" };
+        let link = match kind {
+            LibKind::Static => format!("cc app.c -I{out} {lib}{extra}", out = output.display(), lib = lib_path.display()),
+            LibKind::Shared => format!("cc app.c -I{out} -L{out} -l{crate_name}{extra}", out = output.display()),
+        };
+        eprintln!("done: {} ({}) + {}/aot_llm.h in {:.1}s (cargo {:.1}s)\nlink: {link}", lib_path.display(), human(size), output.display(), t0.elapsed().as_secs_f64(), built.elapsed.as_secs_f64());
+        return Ok(());
+    }
+
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;

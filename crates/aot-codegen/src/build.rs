@@ -15,6 +15,8 @@ pub struct BuildOptions {
     pub quiet: bool,
     /// Cargo executable.
     pub cargo: Option<PathBuf>,
+    /// Expect a library artifact instead of an executable.
+    pub lib: Option<crate::emit::LibKind>,
 }
 
 /// Result of a successful build.
@@ -24,7 +26,8 @@ pub struct BuildOutput {
     pub elapsed: std::time::Duration,
 }
 
-/// Build the project in `dir` and return the path of the release binary.
+/// Build the project in `dir` and return the path of the release binary (or
+/// library, with `BuildOptions::lib`).
 pub fn cargo_build(dir: &Path, crate_name: &str, o: &BuildOptions) -> Result<BuildOutput> {
     let cargo = o.cargo.clone().unwrap_or_else(|| PathBuf::from(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into())));
     // Cargo resolves a relative CARGO_TARGET_DIR against its own cwd.
@@ -56,9 +59,14 @@ pub fn cargo_build(dir: &Path, crate_name: &str, o: &BuildOptions) -> Result<Bui
         bin.push(t);
     }
     bin.push("release");
-    bin.push(crate_name);
-    if o.target.as_deref().is_some_and(|t| t.contains("windows")) {
-        bin.set_extension("exe");
+    match o.lib {
+        Some(kind) => bin.push(kind.file_name(crate_name, o.target.as_deref())),
+        None => {
+            bin.push(crate_name);
+            if o.target.as_deref().is_some_and(|t| t.contains("windows")) {
+                bin.set_extension("exe");
+            }
+        }
     }
     if !bin.exists() {
         return Err(anyhow!("build succeeded but {} was not produced", bin.display()));

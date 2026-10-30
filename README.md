@@ -1,6 +1,8 @@
 # aot-llm
 
-Ahead-of-time compiler that turns a quantized GGUF model into **one native executable**: no runtime, no Python, no interpreter, no model file to load. The weights are placed in a read-only section of the binary, the OS maps them lazily, and the first forward pass starts about **0.2 ms** after `main()`.
+[![CI](https://github.com/p10node/aot-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/p10node/aot-llm/actions/workflows/ci.yml)
+
+Ahead-of-time compiler that turns a quantized GGUF model into **one native executable**, or into **one C library** (`--lib`): no runtime, no Python, no interpreter, no model file to load. The weights are placed in a read-only section of the binary, the OS maps them lazily, and the first forward pass starts about **0.2 ms** after `main()`. Llama, Qwen2/2.5, Qwen3 and Phi-3 models are supported.
 
 ```text
 $ aot-llm compile --model tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --output ./tinyllama_bin
@@ -37,7 +39,7 @@ aot-llm is about **first-response latency and packaging**, not raw throughput. S
 | deployment | one file, no runtime, no daemon; copy and run; static Linux cross-build | install Ollama, pull the model, keep a server up |
 | models | `llama`, `qwen2`, `qwen3`, `phi3` architectures, 9 tensor types | every architecture and quantization |
 
-**Good fit:** command-line tools, agents that call a model many times for short answers, edge / serverless / cron jobs where a process spawns, answers and exits, embedding a model in an application.
+**Good fit:** command-line tools, agents that call a model many times for short answers, edge / serverless / cron jobs where a process spawns, answers and exits, embedding a model in an application (`--lib` gives a static or shared library with a C API; see [`examples/`](examples/)).
 
 **Poor fit:** multi-user chat servers, very long prompts (RAG, documents) on the CPU, machines whose GPU is not an Apple one (only Metal is supported). vLLM and friends solve a different problem (batched GPU serving, cold starts of tens of seconds) and are not comparable for one process answering one request.
 
@@ -49,8 +51,11 @@ aot-llm is about **first-response latency and packaging**, not raw throughput. S
 * **SIMD kernels** for Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, F16, BF16 and F32 weights: NEON (with `sdot` when available) on ARM64, AVX2 + FMA (+ F16C) on x86_64, scalar fallback. The implementation is picked once at startup, so a binary runs on any CPU of its architecture.
 * **Batched prompt processing.** Prompt tokens go through the model in chunks of up to 64 (`--batch`); each weight row is read once per chunk and multiplied against four activations at a time by 1x4 micro-kernels, so prompt evaluation is compute-bound rather than memory-bound. Results are bit-identical to token-by-token evaluation.
 * **Compile-time KV prefix cache.** `aot-llm compile --system "..."` evaluates the system prompt at build time and embeds its key/value cache in the binary; a chat prompt with that system prompt skips straight to the user turn.
+* **Conversations across processes.** `--save-kv FILE` writes the tokens and KV cache of a run; `--load-kv FILE` continues it (with `--chat`: as the next user turn), so a multi-turn dialogue driven by separate process invocations only ever evaluates the new turn. The C API has `aot_ctx_save` / `aot_ctx_load` and `aot_generate` continues the conversation held in a context.
+* **Output constraints for tools.** `--stop TEXT` ends generation before a string (held back until it is known not to be one), `--choices a,b,c` restricts the answer to exactly one of the given strings by masking the logits along a token trie: classifiers and routers that never need parsing. Both are in the C API too.
 * **Background prefault.** At startup worker threads page the weights in (`madvise` + page touch) while the main thread tokenizes, which shortens cold first-token latency. `--no-prefetch` turns it off.
 * **Single-binary output.** `aot-llm compile` writes a standalone Cargo project and builds it; cross-compiling to `x86_64-unknown-linux-musl` from macOS produces a static ELF.
+* **Library output.** `aot-llm compile --lib` produces `lib<name>.a` (or `--lib shared`: `.dylib` / `.so`) plus `aot_llm.h`: open the model, tokenize, evaluate, read logits, sample, or call one `aot_generate` with a token callback. The weights are embedded the same way, so an application links the model like any other library and still pays nothing at startup. See [Library mode](#library-mode-c-api).
 * **Optional Metal backend.** `aot-llm compile --gpu metal` adds a GPU path for Apple Silicon. The weights section of the executable is handed to Metal without a copy (unified memory), the activation buffers and the KV cache are shared between CPU and GPU, and a decode step is one command buffer of eight kernel dispatches per layer (RoPE, the SwiGLU product and the residual adds are fused into the quantized matrix-vector kernels). Prompt batches run as a simdgroup-matrix GEMM. The frameworks are loaded with `dlopen`, so the binary still links only `libSystem`, runs on the CPU with `--device cpu` and falls back to it when no GPU is available. The kernels are embedded as source and compiled by the system once per machine (cached afterwards).
 
 ## Quick start
@@ -86,6 +91,9 @@ cargo build --release
 ./qwen3 --chat --prompt "Write one sentence about the moon."
 ./target/release/aot-llm compile --model ./qwen2.5-0.5b-instruct-q4_k_m.gguf --output ./qwen25
 
+# A C library instead of an executable (see examples/c/main.c, examples/python/)
+./target/release/aot-llm compile --model ./Qwen3-0.6B-Q4_K_M.gguf --output ./libqwen3 --lib --name qwen3
+cc -O2 examples/c/main.c -I./libqwen3 ./libqwen3/libqwen3.a -o chat && ./chat "Why is the sky blue?"
 
 # Tools: constrained answers, stop strings, conversations across processes
 ./qwen3 --chat --prompt "Is this review positive? 'Broke after two days.'" --choices positive,negative,neutral
@@ -127,7 +135,7 @@ Generated binary options:
     --info               Print model information and exit
 ```
 
-Compiler options (`aot-llm compile --help`): `--gpu metal` (compile the Metal backend in, macOS only), `--system TEXT` / `--prefix TEXT` (bake a KV prefix cache), `--target <triple>`, `--native` (`-C target-cpu=native`), `--sidecar`, `--emit-only` (generate the project without building), `--build-dir`, `--name`, `-j`, `-q`.
+Compiler options (`aot-llm compile --help`): `--lib [static|shared]` (build a model library with the C API instead of an executable; `--output` is then a directory), `--symbol-prefix PFX` (prefix the library's C symbols and header names so several models can be linked into one program), `--gpu metal` (compile the Metal backend in, macOS only), `--system TEXT` / `--prefix TEXT` (bake a KV prefix cache), `--target <triple>`, `--native` (`-C target-cpu=native`), `--sidecar`, `--emit-only` (generate the project without building), `--build-dir`, `--name`, `-j`, `-q`.
 
 Debugging: `AOT_DEBUG_COMPARE=1 ./bin ...` re-evaluates the prompt token by token and reports the first KV-cache divergence from the batched path; `--dump-logits` prints the logits of the last prompt token.
 
@@ -194,9 +202,32 @@ Prompt tokens are processed by `forward_batch` in chunks: every weight row is lo
 | crate                | role                                                                                                                                                                                |
 |----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `crates/aot-gguf`    | GGUF v2/v3 parser (header, metadata, tensor descriptors), memory-mapped access, in-memory writer for tests                                                                          |
-| `crates/aot-kernels` | the runtime: quant layouts, SIMD matvec kernels, RMSNorm / RoPE / attention, thread pool, tokenizer, sampler, CLI driver, Metal backend (`metal.rs`, `shaders.metal`). Copied verbatim into every generated project as `src/rt/` |
-| `crates/aot-codegen` | graph extraction (`ModelSpec`), tokenizer blob builder, Rust project emitter, cargo driver                                                                                          |
+| `crates/aot-kernels` | the runtime: quant layouts, SIMD matvec kernels, RMSNorm / RoPE / attention, thread pool, tokenizer, sampler, CLI driver, C API (`capi.rs`), Metal backend (`metal.rs`, `shaders.metal`). Copied verbatim into every generated project as `src/rt/` |
+| `crates/aot-codegen` | graph extraction (`ModelSpec`), tokenizer blob builder, Rust project emitter (binary or library), the C header (`aot_llm.h`), cargo driver                                             |
 | `crates/aot-llm`     | the `aot-llm` CLI: `compile`, `inspect`, `tokenize`                                                                                                                                 |
+| `examples/`          | `c/main.c` (the C API), `python/` (ctypes binding), `commit-msg/` (a git commit-message generator in one binary)                                                                     |
+
+## Library mode (C API)
+
+`aot-llm compile --lib` builds the same generated project as a `staticlib` (`--lib shared`: `cdylib`) whose entry points are the functions of [`aot_llm.h`](crates/aot-codegen/src/aot_llm.h):
+
+```c
+aot_model *m = aot_open(NULL);                 /* weights mapped, tokenizer ready, threads up: ~1 ms warm */
+aot_ctx *c = aot_ctx_new(m, 512, 0);           /* one sequence, 512-token context */
+aot_generate_params p = aot_generate_default_params();
+p.chat = 1; p.system = "You are a concise assistant."; p.max_tokens = 96;
+aot_generate(c, "Why is the sky blue?", 0, &p, print_piece, NULL);   /* streams pieces to the callback */
+
+uint32_t ids[64];
+int32_t n = aot_tokenize(m, "The capital of France is", 0, -1, 1, ids, 64);
+aot_ctx_reset(c);
+aot_eval(c, ids, n, 1);
+const float *logits = aot_logits(c);           /* n_vocab floats */
+```
+
+The model is a process-wide singleton (the library *is* the model); contexts and samplers are plain handles. Evaluations are serialised internally, so contexts can be driven from any thread. `aot_generate` appends to its context, so calling it again continues the conversation; `aot_ctx_save` / `aot_ctx_load` move a conversation between processes; `aot_generate_params.stop` and `.choices` are the CLI's `--stop` / `--choices`. A compile-time KV prefix (`--system`) is honoured by `aot_eval` when a fresh context starts with the baked tokens. `--gpu metal` works the same way as for executables (`aot_model_params.device`). Link with `cc app.c libmodel.a` on macOS and `cc app.c libmodel.a -lpthread -ldl -lm` on Linux; the compiler prints the line. To link several models into one program build each with `--symbol-prefix qwen3_` (and so on): the symbols and the header's identifiers get the prefix.
+
+[`examples/c/main.c`](examples/c/main.c) is a complete program, [`examples/python/aot_llm.py`](examples/python/aot_llm.py) a ctypes binding with the same surface (`Model.generate`, streaming, `save` / `load`, `choices`, `stop`), and [`examples/commit-msg/`](examples/commit-msg/) shows the executable side: a commit-message generator with the instructions baked in, usable as a `prepare-commit-msg` hook.
 
 ## Benchmarks
 
@@ -260,9 +291,10 @@ Decode speed is within ~10% of llama.cpp's CPU path. Prompt evaluation is the kn
   * `crates/aot-kernels/tests/dots.rs`: every SIMD dot product (NEON, NEON+dotprod, AVX2, AVX2+F16C) against the scalar reference and a float reference, for every supported weight type;
   * `crates/aot-kernels/tests/metal.rs` (macOS): every Metal kernel against the CPU operators: the matrix product for all nine weight formats (single vector, batched, partial tiles, residual accumulation), the fused RoPE / gate / RMSNorm variants, RMSNorm, RoPE, attention for 64- and 128-wide heads, SwiGLU; skipped when no Metal device exists;
   * `crates/aot-codegen/tests/tokenizer_blob.rs`: SentencePiece and byte-level BPE round trips through the serialised blob;
-  * `crates/aot-llm/tests/e2e.rs`: builds a tiny random Llama GGUF that uses all eight weight types, compiles it with the CLI, runs the binary with `--dump-logits` and compares against an f32 reference forward pass (max error 0.0000 on the logits); on macOS it also compiles the model with `--gpu metal` and checks the GPU logits (single-token and batched prompt paths) against the unquantized reference.
-* Tokenization was checked against llama.cpp ids for both vocabularies (e.g. Llama 3 `"Hello world"` -> `[128000, 9906, 1917]`, TinyLlama -> `[1, 15043, 3186]`).
-* Greedy generations of both real models match Ollama/llama.cpp token for token.
+  * `crates/aot-llm/tests/e2e.rs`: builds a tiny random GGUF for each architecture (`llama`, `qwen2` with biases, `qwen3` with q/k norms and `q_dim > dim`, `phi3` with fused tensors) that uses all nine weight types, compiles it with the CLI, runs the binary with `--dump-logits` and compares against an f32 reference forward pass (max error 0.0000 on the logits); on macOS it also compiles each model with `--gpu metal` and checks the GPU logits (single-token and batched prompt paths) against the unquantized reference. Further tests compile the model with `--lib`, build a C client against `aot_llm.h` with the system C compiler and check tokens, logits (batched, token by token, and after `aot_ctx_save` / `aot_ctx_load`), `aot_generate` and `choices`; and exercise `--stop`, `--choices` and the `--save-kv` / `--load-kv` continuation (bit-identical to evaluating the whole prompt at once).
+* The same suite runs in CI on Linux x86_64 (AVX2) and macOS Apple Silicon (NEON + Metal), plus a musl cross-build ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+* Tokenization was checked against llama.cpp ids for the three vocabularies (e.g. Llama 3 `"Hello world"` -> `[128000, 9906, 1917]`, TinyLlama -> `[1, 15043, 3186]`; Qwen uses the Llama 3 regex with single-digit numbers).
+* Greedy generations of the real models match Ollama/llama.cpp token for token: TinyLlama-1.1B, Llama-3.2-1B, Qwen2.5-0.5B-Instruct (Q8_0 and Q4_K_M, the latter mostly `q5_0`) on CPU and Metal, Qwen3-0.6B on CPU and Metal for raw prompts (the chat prompt of this 0.6B model is a low-margin case where llama.cpp's own CPU and Metal backends disagree with each other as well), Phi-3-mini-4k-instruct Q4_K_M (38-token chat reply identical to llama.cpp's CPU output; its Metal output differs from both, as llama.cpp's own does).
 * The AVX2 kernels were validated by running the test suite under `docker run --platform linux/amd64`; a TinyLlama binary cross-compiled to `x86_64-unknown-linux-musl` runs in the same container (`avx2+f16c`).
 
 ## Cross-compiling
@@ -287,7 +319,7 @@ For `*-musl` targets the generated project links with `rust-lld` and the self-co
 * Single sequence, batch size 1, unix targets (the weight embedding uses `global_asm!`, memory mapping uses `mmap`). GPU: Metal on macOS / Apple Silicon only (`--gpu metal`), head sizes of 32, 64, 96 or 128.
 * Not yet: KV-cache quantization, Gemma / Phi-4 / MoE architectures, LongRoPE, CUDA / Vulkan backends.
 
-`unsafe` is confined to SIMD intrinsics, the `.incbin` symbol and `mmap` views, the fork-join pool's lifetime-erased job pointer and disjoint-range writes, and the Metal backend's `objc_msgSend` calls; each site is commented with its invariant.
+`unsafe` is confined to SIMD intrinsics, the `.incbin` symbol and `mmap` views, the fork-join pool's lifetime-erased job pointer and disjoint-range writes, the Metal backend's `objc_msgSend` calls and the raw handles of the C API; each site is commented with its invariant.
 
 ## License
 

@@ -6,6 +6,7 @@
 #![allow(dead_code, unused_imports, clippy::missing_safety_doc, clippy::needless_range_loop)]
 
 pub mod app;
+pub mod capi;
 pub mod chat;
 pub mod constrain;
 pub mod matvec;

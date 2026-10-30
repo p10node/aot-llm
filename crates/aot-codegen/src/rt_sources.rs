@@ -6,6 +6,7 @@
 pub const RT_SOURCES: &[(&str, &str)] = &[
     ("mod.rs", include_str!("../../aot-kernels/src/lib.rs")),
     ("app.rs", include_str!("../../aot-kernels/src/app.rs")),
+    ("capi.rs", include_str!("../../aot-kernels/src/capi.rs")),
     ("chat.rs", include_str!("../../aot-kernels/src/chat.rs")),
     ("constrain.rs", include_str!("../../aot-kernels/src/constrain.rs")),
     ("matvec.rs", include_str!("../../aot-kernels/src/matvec.rs")),
@@ -23,3 +24,6 @@ pub const RT_SOURCES: &[(&str, &str)] = &[
     ("tokenizer.rs", include_str!("../../aot-kernels/src/tokenizer.rs")),
     ("weights.rs", include_str!("../../aot-kernels/src/weights.rs")),
 ];
+
+/// The C header of a model library (`aot-llm compile --lib`).
+pub const C_HEADER: &str = include_str!("aot_llm.h");

@@ -93,13 +93,14 @@ fn emit_quantize(out: &mut String, src: &str, n: usize, kinds: impl Iterator<Ite
     }
 }
 
-/// Batched activation quantization over `m` rows of `src` (row length `n`).
+/// Batched activation quantization over `m` rows of `src` (row length `n`),
+/// spread over the pool.
 fn emit_quantize_rows(out: &mut String, src: &str, n: usize, kinds: impl Iterator<Item = Kind>) {
     let acts: BTreeSet<Activation> = kinds.map(Kind::activation).collect();
     for a in acts {
         match a {
-            Activation::Q8_0 => writeln!(out, "    quantize_q8_0(&s.{src}[..m * {n}], &mut s.baq0);").unwrap(),
-            Activation::Q8_K => writeln!(out, "    quantize_q8_k(&s.{src}[..m * {n}], &mut s.baqk);").unwrap(),
+            Activation::Q8_0 => writeln!(out, "    quantize_q8_0_par(pool, &s.{src}[..m * {n}], &mut s.baq0);").unwrap(),
+            Activation::Q8_K => writeln!(out, "    quantize_q8_k_par(pool, &s.{src}[..m * {n}], &mut s.baqk);").unwrap(),
             Activation::F32 => {}
         }
     }
@@ -125,7 +126,7 @@ fn emit_layer_batch(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec)
     writeln!(out, "#[inline(never)]").unwrap();
     writeln!(out, "fn layer_{i}_batch(s: &mut State, w: &Weights, pool: &Pool, pos0: usize, m: usize) {{").unwrap();
     writeln!(out, "    let l = &LAYERS[{i}];").unwrap();
-    writeln!(out, "    rmsnorm_rows(&mut s.bxb, &s.bx, w.f32s(&l.attn_norm), DIMS.eps, m);").unwrap();
+    writeln!(out, "    rmsnorm_rows_par(pool, &mut s.bxb, &s.bx, w.f32s(&l.attn_norm), DIMS.eps, m);").unwrap();
     emit_quantize_rows(out, "bxb", dim, [l.wq.kind, l.wk.kind, l.wv.kind].into_iter());
     emit_matmul(out, &l.wq, "l.wq", "bq", "bxb");
     emit_matmul(out, &l.wk, "l.wk", "bk", "bxb");
@@ -146,8 +147,8 @@ fn emit_layer_batch(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec)
     writeln!(out, "    attention_rows(pool, &mut s.bxb, &s.bq, &s.k_cache, &s.v_cache, &mut s.scores, &DIMS, s.ctx, {i}, pos0, m);").unwrap();
     emit_quantize_rows(out, "bxb", qd, [l.wo.kind].into_iter());
     emit_matmul(out, &l.wo, "l.wo", "bxb2", "bxb");
-    writeln!(out, "    add_inplace(&mut s.bx[..m * {dim}], &s.bxb2[..m * {dim}]);").unwrap();
-    writeln!(out, "    rmsnorm_rows(&mut s.bxb, &s.bx, w.f32s(&l.ffn_norm), DIMS.eps, m);").unwrap();
+    writeln!(out, "    add_inplace_par(pool, &mut s.bx[..m * {dim}], &s.bxb2[..m * {dim}]);").unwrap();
+    writeln!(out, "    rmsnorm_rows_par(pool, &mut s.bxb, &s.bx, w.f32s(&l.ffn_norm), DIMS.eps, m);").unwrap();
     emit_quantize_rows(out, "bxb", dim, [l.gate.kind, l.up.kind].into_iter());
     let fused = l.gate.kind == l.up.kind && l.gate.kind.activation() != Activation::F32;
     if fused {
@@ -168,10 +169,10 @@ fn emit_layer_batch(out: &mut String, i: usize, l: &LayerSpec, spec: &ModelSpec)
         emit_matmul(out, &l.gate, "l.gate", "bhb", "bxb");
         emit_matmul(out, &l.up, "l.up", "bhb2", "bxb");
     }
-    writeln!(out, "    silu_mul(&mut s.bhb[..m * {hidden}], &s.bhb2[..m * {hidden}]);").unwrap();
+    writeln!(out, "    silu_mul_par(pool, &mut s.bhb[..m * {hidden}], &s.bhb2[..m * {hidden}]);").unwrap();
     emit_quantize_rows(out, "bhb", hidden, [l.down.kind].into_iter());
     emit_matmul(out, &l.down, "l.down", "bxb2", "bhb");
-    writeln!(out, "    add_inplace(&mut s.bx[..m * {dim}], &s.bxb2[..m * {dim}]);").unwrap();
+    writeln!(out, "    add_inplace_par(pool, &mut s.bx[..m * {dim}], &s.bxb2[..m * {dim}]);").unwrap();
     writeln!(out, "}}\n").unwrap();
 }
 

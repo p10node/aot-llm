@@ -318,6 +318,100 @@ pub fn rmsnorm_heads_rows(x: &mut [f32], w: &[f32], m: usize, n_heads: usize, he
     rmsnorm_heads(&mut x[..m * n_heads * head_dim], w, m * n_heads, head_dim, eps);
 }
 
+// ---------------------------------------------------------------------------
+// Parallel element-wise operators for prompt batches. The arithmetic per
+// element is exactly that of the serial functions above (same order), so the
+// results stay bit-identical to the token-by-token path; only the work is
+// spread over the pool, which otherwise sits idle between the matrix products
+// while the main thread normalises, gates and quantizes tens of thousands of
+// values per layer.
+// ---------------------------------------------------------------------------
+
+/// Elements per parallel chunk: enough work to amortise the hand-off.
+const PAR_CHUNK: usize = 4096;
+
+/// [`rmsnorm_rows`] with the rows distributed over the pool.
+pub fn rmsnorm_rows_par(pool: &Pool, out: &mut [f32], x: &[f32], w: &[f32], eps: f32, m: usize) {
+    let n = w.len();
+    if m < 2 || pool.n_threads() == 1 {
+        return rmsnorm_rows(out, x, w, eps, m);
+    }
+    let o = SendPtr(out.as_mut_ptr());
+    pool.run_chunks(m, 1, &|range| {
+        for i in range {
+            // SAFETY: each row is written by exactly one chunk.
+            let dst = unsafe { o.slice_mut(i * n..(i + 1) * n) };
+            rmsnorm(dst, &x[i * n..(i + 1) * n], w, eps);
+        }
+    });
+}
+
+/// [`silu_mul`] over the pool.
+pub fn silu_mul_par(pool: &Pool, h: &mut [f32], up: &[f32]) {
+    let n = h.len().min(up.len());
+    if n < 2 * PAR_CHUNK || pool.n_threads() == 1 {
+        return silu_mul(&mut h[..n], &up[..n]);
+    }
+    let o = SendPtr(h.as_mut_ptr());
+    pool.run_chunks(n, PAR_CHUNK, &|range| {
+        // SAFETY: disjoint element ranges.
+        let dst = unsafe { o.slice_mut(range.clone()) };
+        silu_mul(dst, &up[range]);
+    });
+}
+
+/// [`add_inplace`] over the pool.
+pub fn add_inplace_par(pool: &Pool, x: &mut [f32], y: &[f32]) {
+    let n = x.len().min(y.len());
+    if n < 2 * PAR_CHUNK || pool.n_threads() == 1 {
+        return add_inplace(&mut x[..n], &y[..n]);
+    }
+    let o = SendPtr(x.as_mut_ptr());
+    pool.run_chunks(n, PAR_CHUNK, &|range| {
+        // SAFETY: disjoint element ranges.
+        let dst = unsafe { o.slice_mut(range.clone()) };
+        add_inplace(dst, &y[range]);
+    });
+}
+
+/// [`super::quant::quantize_q8_k`] with the blocks distributed over the pool.
+pub fn quantize_q8_k_par(pool: &Pool, x: &[f32], out: &mut Vec<super::quant::BlockQ8_K>) {
+    use super::quant::{quantize_q8_k, BlockQ8_K, QK_K};
+    debug_assert_eq!(x.len() % QK_K, 0);
+    let nb = x.len() / QK_K;
+    if nb < 16 || pool.n_threads() == 1 {
+        return quantize_q8_k(x, out);
+    }
+    out.resize(nb, BlockQ8_K::default());
+    let o = SendPtr(out.as_mut_ptr());
+    pool.run_chunks(nb, 4, &|range| {
+        // SAFETY: disjoint block ranges; each block depends only on its 256 inputs.
+        let dst = unsafe { o.slice_mut(range.clone()) };
+        let mut tmp = Vec::with_capacity(range.len());
+        quantize_q8_k(&x[range.start * QK_K..range.end * QK_K], &mut tmp);
+        dst.copy_from_slice(&tmp);
+    });
+}
+
+/// [`super::quant::quantize_q8_0`] with the blocks distributed over the pool.
+pub fn quantize_q8_0_par(pool: &Pool, x: &[f32], out: &mut Vec<super::quant::BlockQ8_0>) {
+    use super::quant::{quantize_q8_0, BlockQ8_0, QK8_0};
+    debug_assert_eq!(x.len() % QK8_0, 0);
+    let nb = x.len() / QK8_0;
+    if nb < 128 || pool.n_threads() == 1 {
+        return quantize_q8_0(x, out);
+    }
+    out.resize(nb, BlockQ8_0::default());
+    let o = SendPtr(out.as_mut_ptr());
+    pool.run_chunks(nb, 32, &|range| {
+        // SAFETY: disjoint block ranges.
+        let dst = unsafe { o.slice_mut(range.clone()) };
+        let mut tmp = Vec::with_capacity(range.len());
+        quantize_q8_0(&x[range.start * QK8_0..range.end * QK8_0], &mut tmp);
+        dst.copy_from_slice(&tmp);
+    });
+}
+
 /// Store `m` consecutive key/value rows starting at `pos0`.
 #[allow(clippy::too_many_arguments)]
 pub fn store_kv_rows(k_cache: &mut [f32], v_cache: &mut [f32], k: &[f32], v: &[f32], d: &Dims, ctx: usize, layer: usize, pos0: usize, m: usize) {
@@ -378,6 +472,37 @@ mod batch_tests {
     fn lcg(seed: &mut u64) -> f32 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((*seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+
+    #[test]
+    fn parallel_elementwise_matches_serial_bitwise() {
+        let pool = Pool::new(4);
+        let mut seed = 11u64;
+        let (m, n) = (9usize, 2048usize);
+        let x: Vec<f32> = (0..m * n).map(|_| lcg(&mut seed) * 3.0).collect();
+        let w: Vec<f32> = (0..n).map(|_| 1.0 + lcg(&mut seed) * 0.3).collect();
+        let mut a = vec![0f32; m * n];
+        let mut b = vec![0f32; m * n];
+        rmsnorm_rows(&mut a, &x, &w, 1e-5, m);
+        rmsnorm_rows_par(&pool, &mut b, &x, &w, 1e-5, m);
+        assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+        let up: Vec<f32> = (0..m * n).map(|_| lcg(&mut seed) * 2.0).collect();
+        let mut h1 = x.clone();
+        let mut h2 = x.clone();
+        silu_mul(&mut h1, &up);
+        silu_mul_par(&pool, &mut h2, &up);
+        assert!(h1.iter().zip(&h2).all(|(p, q)| p.to_bits() == q.to_bits()));
+        add_inplace(&mut h1, &up);
+        add_inplace_par(&pool, &mut h2, &up);
+        assert!(h1.iter().zip(&h2).all(|(p, q)| p.to_bits() == q.to_bits()));
+        let (mut q1, mut q2) = (Vec::new(), Vec::new());
+        super::super::quant::quantize_q8_k(&x, &mut q1);
+        quantize_q8_k_par(&pool, &x, &mut q2);
+        assert!(q1.iter().zip(&q2).all(|(p, q)| p.d.to_bits() == q.d.to_bits() && p.qs == q.qs && p.bsums == q.bsums));
+        let (mut r1, mut r2) = (Vec::new(), Vec::new());
+        super::super::quant::quantize_q8_0(&x, &mut r1);
+        quantize_q8_0_par(&pool, &x, &mut r2);
+        assert!(r1.iter().zip(&r2).all(|(p, q)| p.d.to_bits() == q.d.to_bits() && p.qs == q.qs));
     }
 
     #[test]

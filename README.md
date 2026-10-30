@@ -172,6 +172,7 @@ tokens -> embedding -> [RMSNorm -> Attention(GQA, RoPE, KV cache) -> + -> RMSNor
 
 Qwen2 adds bias vectors to the q / k / v projections and Qwen3 a per-head RMSNorm of q and k before RoPE; both rotate `(i, i + rot_dim / 2)` pairs (the GPT-NeoX layout) instead of adjacent elements. Phi-3 stores q / k / v as one `attn_qkv` tensor and gate / up as one `ffn_up` tensor; the compiler addresses the parts as row ranges of the same bytes, so the generated code is the plain block. The code generator emits exactly the operators the architecture has, on the CPU and on the GPU (where the NEOX models rotate in a separate dispatch because the pairs are half a head apart, and the biases are added in the epilogue of the matrix kernels).
 
+Prompt batches run the matrix products over dynamically scheduled row blocks and the element-wise work (RMSNorm, SwiGLU, residual adds, activation quantization) over the pool as well, with the same per-element arithmetic as the token-by-token path, so batched and single evaluation stay bit-identical.
 
 Per matmul, the f32 activation vector is quantized once to Q8_0 (for Q4_0/Q8_0 weights) or Q8_K (for K-quants) and every output row is an integer dot product scaled back to f32, the same scheme ggml uses, so results match llama.cpp. During decoding the q/k/v projections form one parallel region and gate/up another; rows are handed out in dynamic chunks; attention is parallel over heads. The thread pool keeps workers hot between the few hundred small parallel regions of a decode step.
 

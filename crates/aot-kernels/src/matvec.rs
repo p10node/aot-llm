@@ -481,8 +481,11 @@ fn matmul_rows<T: Sync>(pool: &Pool, out: &mut [f32], w: &[u8], xs: &[T], m: usi
     assert!(w.len() >= rows * row_bytes, "weight slice too small");
     assert!(xs.len() >= m * nb, "input slice too small: {} < {}", xs.len(), m * nb);
     let o = SendPtr(out.as_mut_ptr());
-    pool.run(&|tid, nth| {
-        let range = split(rows, tid, nth);
+    // Row blocks are handed out dynamically (like the decode products): a
+    // static split waits for the slowest thread, which under other load or
+    // on efficiency cores costs more than the hand-offs.
+    let chunk = (rows / (pool.n_threads() * 4)).max(ROW_BLOCK).div_ceil(ROW_BLOCK) * ROW_BLOCK;
+    pool.run_chunks(rows, chunk, &|range| {
         let mut r0 = range.start;
         while r0 < range.end {
             let r1 = (r0 + ROW_BLOCK).min(range.end);
